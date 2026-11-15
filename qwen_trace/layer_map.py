@@ -1,15 +1,14 @@
-#!/usr/bin/env python3
 """
-layer_map.py — карта важности слоёв: что будет, если отключать слои по одному.
+layer-map — карта важности слоёв: что будет, если отключать слои по одному.
 
-Обычно запускается внутри trace_qwen.py:
-    python trace_qwen.py /путь/к/модели "промпт" --layer-map
+Обычно запускается внутри команды trace:
+    python -m qwen_trace trace /путь/к/модели "промпт" --layer-map
 Тогда layer_map.json ложится в ту же папку, что trace.log, а в trace.log попадает таблица.
 
 Отдельно (карта для уже сделанного прогона — файл добавится в его папку):
-    python layer_map.py /путь/к/модели --run-dir trace_logs/20261115_184500
-    python layer_map.py /путь/к/модели --prompts prompts/extended.txt --tokens 12 --window 4
-    python layer_map.py /путь/к/модели --fast          # без перебора, только угловое расстояние
+    python -m qwen_trace layer-map /путь/к/модели --run-dir trace_logs/20261115_184500
+    python -m qwen_trace layer-map /путь/к/модели --prompts prompts/extended.txt --tokens 12 --window 4
+    python -m qwen_trace layer-map /путь/к/модели --fast          # без перебора, только угловое расстояние
 
 Два измерения:
 
@@ -27,9 +26,9 @@ layer_map.py — карта важности слоёв: что будет, ес
    вопрос — какой блок удалять ЦЕЛИКОМ: важности отдельных слоёв не складываются, потому
    что слои компенсируют друг друга.
 
-Градиентную оценку важности слоёв (attribution patching) я убрал: на Qwen3.8-27B она
+Градиентная оценка важности слоёв (attribution patching) убрана: на Qwen3.8-27B она
 коррелировала с перебором на 0,12, то есть не давала надёжной подсказки. Функция atp
-осталась в attribution.py как экспериментальная.
+осталась в experimental.py как экспериментальная.
 
 С --thinking сравниваются токены ответа ПОСЛЕ блока рассуждений, а не его начало.
 
@@ -43,9 +42,8 @@ from pathlib import Path
 
 import mlx.core as mx
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-from attribution import angular_distances, residual_stack  # noqa: E402
-from qcore import (Hooks, bootstrap_ci, eos_ids, format_prompt, kl_div, layer_name,  # noqa: E402
+from .attribution import angular_distances, residual_stack
+from .core import (Hooks, bootstrap_ci, eos_ids, format_prompt, kl_div, layer_name,
                    load_model, log_softmax)
 
 DEFAULT_PROMPTS = [
@@ -276,10 +274,10 @@ def save_json(res: dict, path):
     Path(path).write_text(json.dumps(res, ensure_ascii=False, indent=1), encoding="utf-8")
 
 
-def main():
-    ap = argparse.ArgumentParser(description="Карта важности слоёв Qwen (MLX)")
+def main(argv=None):
+    ap = argparse.ArgumentParser(prog="qwen-trace layer-map", description="Карта важности слоёв Qwen (MLX)")
     ap.add_argument("model_path")
-    ap.add_argument("--run-dir", help="папка прогона trace_qwen.py: карта добавится в неё "
+    ap.add_argument("--run-dir", help="папка прогона trace: карта добавится в неё "
                                       "(и report.html будет пересобран)")
     ap.add_argument("--prompts", help="файл с промптами, один в строке (по умолчанию "
                                       f"{len(DEFAULT_PROMPTS)} встроенных; есть prompts/extended.txt)")
@@ -292,7 +290,7 @@ def main():
     ap.add_argument("--think-max", type=int, default=512, help="предел длины рассуждения в токенах")
     ap.add_argument("--raw", action="store_true", help="не применять шаблон чата")
     ap.add_argument("--out", default="layer_map")
-    a = ap.parse_args()
+    a = ap.parse_args(argv)
 
     run_dir = Path(a.run_dir) if a.run_dir else None
     first = None
@@ -319,8 +317,8 @@ def main():
     print(f"\nСохранено: {out / 'layer_map.json'}")
     if run_dir:
         try:
-            import make_report
-            print("Отчёт пересобран:", make_report.build_report(run_dir))
+            from . import report
+            print("Отчёт пересобран:", report.build_report(run_dir))
         except ImportError:
             pass
 

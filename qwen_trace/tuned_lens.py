@@ -1,6 +1,5 @@
-#!/usr/bin/env python3
 """
-tuned_lens.py — обучаемая линза (tuned lens, Belrose et al., 2023) для logit lens.
+tuned-lens — обучаемая линза (tuned lens, Belrose et al., 2023) для logit lens.
 
 Обычный logit lens подаёт вектор промежуточного слоя прямо в финальную норму и lm_head.
 Но ранние слои «говорят» в другом базисе, поэтому их промежуточные ответы систематически
@@ -8,11 +7,11 @@ tuned_lens.py — обучаемая линза (tuned lens, Belrose et al., 202
 переводит вектор слоя в базис последнего слоя. Сама модель не меняется.
 
 Обучение (один раз на модель, минуты):
-    python tuned_lens.py /путь/к/модели --texts corpus.txt --out lens.safetensors
-    python tuned_lens.py /путь/к/модели                  # без корпуса: на встроенных промптах
+    python -m qwen_trace tuned-lens /путь/к/модели --texts corpus.txt --out lens.safetensors
+    python -m qwen_trace tuned-lens /путь/к/модели                  # без корпуса: на встроенных промптах
 
 Использование:
-    python trace_qwen.py /путь/к/модели "промпт" --tuned-lens lens.safetensors
+    python -m qwen_trace trace /путь/к/модели "промпт" --tuned-lens lens.safetensors
 
 Чем больше текста, тем лучше: встроенных промптов хватает только на грубую линзу,
 для аккуратной нужен файл хотя бы на несколько сотен тысяч токенов.
@@ -26,7 +25,7 @@ from pathlib import Path
 
 import mlx.core as mx
 
-from qcore import (eos_ids, format_prompt, kl_div, lens_logits, load_model, log_softmax,
+from .core import (eos_ids, format_prompt, kl_div, lens_logits, load_model, log_softmax,
                    model_fingerprint, pick_token)
 
 F32 = mx.float32
@@ -165,8 +164,8 @@ def train(model, chunks: list, rank: int = 64, steps: int = 300, lr: float = 1e-
     return TunedLens(params, meta)
 
 
-def main():
-    ap = argparse.ArgumentParser(description="Обучение tuned lens для Qwen (MLX)")
+def main(argv=None):
+    ap = argparse.ArgumentParser(prog="qwen-trace tuned-lens", description="Обучение tuned lens для Qwen (MLX)")
     ap.add_argument("model_path")
     ap.add_argument("--texts", help="текстовый файл-корпус (чем больше, тем лучше)")
     ap.add_argument("--out", default="tuned_lens.safetensors")
@@ -177,14 +176,14 @@ def main():
     ap.add_argument("--seq-len", type=int, default=128, help="длина куска текста в токенах")
     ap.add_argument("--positions", type=int, default=16, help="сколько позиций брать из куска за шаг")
     ap.add_argument("--seed", type=int, default=0)
-    a = ap.parse_args()
+    a = ap.parse_args(argv)
 
     model, tok = load_model(a.model_path)
     if a.texts:
         chunks = chunks_from_text(tok, Path(a.texts).read_text(encoding="utf-8"), a.seq_len)
         print(f"корпус: {len(chunks)} кусков по {a.seq_len} токенов")
     else:
-        import layer_map
+        from . import layer_map
         chunks = chunks_from_prompts(model, tok, layer_map.load_prompts(), 48)
         print("ВНИМАНИЕ: корпус маленький, линза получится грубой. Для аккуратной укажите --texts.")
     if not chunks:
@@ -192,7 +191,7 @@ def main():
     lens = train(model, chunks, a.rank, a.steps, a.lr, a.positions, a.seed)
     lens.meta["model"] = model_fingerprint(a.model_path).get("fingerprint", "")
     lens.save(a.out)
-    print(f"\nЛинза сохранена: {a.out}\nИспользование: python trace_qwen.py {a.model_path} "
+    print(f"\nЛинза сохранена: {a.out}\nИспользование: python -m qwen_trace trace {a.model_path} "
           f"\"промпт\" --tuned-lens {a.out}")
 
 

@@ -1,10 +1,9 @@
-#!/usr/bin/env python3
 """
-quant_compare.py — где квантизация искажает модель: сравнение двух вариантов одной модели.
+quant-compare — где квантизация искажает модель: сравнение двух вариантов одной модели.
 
-    python quant_compare.py /путь/к/исходной /путь/к/4-битной
-    python quant_compare.py /путь/к/8-битной /путь/к/4-битной --prompts prompts/extended.txt
-    python quant_compare.py REF TEST --run-dir trace_logs/<папка>      # добавить в отчёт
+    python -m qwen_trace quant-compare /путь/к/исходной /путь/к/4-битной
+    python -m qwen_trace quant-compare /путь/к/8-битной /путь/к/4-битной --prompts prompts/extended.txt
+    python -m qwen_trace quant-compare REF TEST --run-dir trace_logs/<папка>      # добавить в отчёт
 
 Первая модель — эталон (исходная или менее сжатая), вторая — проверяемая.
 Модели загружаются по очереди, так что память нужна только на одну.
@@ -24,9 +23,8 @@ from pathlib import Path
 
 import mlx.core as mx
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-from layer_map import greedy_answer, load_prompts  # noqa: E402
-from qcore import (bootstrap_ci, eos_ids, format_prompt, kl_div, load_model, log_softmax,  # noqa: E402
+from .layer_map import greedy_answer, load_prompts
+from .core import (bootstrap_ci, eos_ids, format_prompt, kl_div, load_model, log_softmax,
                    model_fingerprint)
 
 F32 = mx.float32
@@ -115,17 +113,17 @@ def render(res: dict) -> str:
     return "\n".join(out)
 
 
-def main():
-    ap = argparse.ArgumentParser(description="Сравнение двух вариантов модели по слоям")
+def main(argv=None):
+    ap = argparse.ArgumentParser(prog="qwen-trace quant-compare", description="Сравнение двух вариантов модели по слоям")
     ap.add_argument("ref_path", help="эталон: исходная или менее сжатая модель")
     ap.add_argument("test_path", help="проверяемая (квантизованная) модель")
     ap.add_argument("--prompts", help="файл с промптами, один в строке")
     ap.add_argument("--tokens", type=int, default=8, help="сколько токенов ответа сравнивать")
     ap.add_argument("--thinking", action="store_true")
     ap.add_argument("--raw", action="store_true")
-    ap.add_argument("--run-dir", help="папка прогона trace_qwen.py: результат добавится в неё и в отчёт")
+    ap.add_argument("--run-dir", help="папка прогона trace: результат добавится в неё и в отчёт")
     ap.add_argument("--out", default="quant_compare")
-    a = ap.parse_args()
+    a = ap.parse_args(argv)
 
     prompts = load_prompts(a.prompts)
     print(f"эталон: {a.ref_path}")
@@ -158,8 +156,8 @@ def main():
         with open(out / "trace.log", "a", encoding="utf-8") as f:
             f.write(text + "\n")
         try:
-            import make_report
-            print("Отчёт пересобран:", make_report.build_report(out))
+            from . import report
+            print("Отчёт пересобран:", report.build_report(out))
         except ImportError:
             pass
 

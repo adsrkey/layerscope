@@ -1,6 +1,5 @@
-#!/usr/bin/env python3
 """
-patching.py — activation patching: где в модели хранится то, что отличает два промпта.
+patch — activation patching: где в модели хранится то, что отличает два промпта.
 
 Отключение слоя отвечает на вопрос «нужен ли слой вообще». Патчинг отвечает на более
 точный: «какой слой и на какой позиции переносит именно эту информацию».
@@ -12,9 +11,9 @@ patching.py — activation patching: где в модели хранится т�
 подменяется выходом из чистого прогона. Если после этого модель снова отвечает «Париж»,
 значит, именно там проходит информация о стране.
 
-    python patching.py /путь/к/модели --clean "Столица Франции —" --corrupt "Столица Италии —"
-    python patching.py /путь/к/модели --clean "..." --corrupt "..." --component all
-    python patching.py /путь/к/модели --clean "..." --corrupt "..." --run-dir trace_logs/<папка>
+    python -m qwen_trace patch /путь/к/модели --clean "Столица Франции —" --corrupt "Столица Италии —"
+    python -m qwen_trace patch /путь/к/модели --clean "..." --corrupt "..." --component all
+    python -m qwen_trace patch /путь/к/модели --clean "..." --corrupt "..." --run-dir trace_logs/<папка>
 
 Оценка клетки: 0 — подмена ничего не изменила, 1 — полностью вернула чистый ответ.
 Промпты лучше подбирать одинаковой длины в токенах: позиции сопоставляются с конца.
@@ -27,8 +26,7 @@ from pathlib import Path
 
 import mlx.core as mx
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-from qcore import Hooks, attn_name, format_prompt, layer_name, load_model, mlp_name  # noqa: E402
+from .core import Hooks, attn_name, format_prompt, layer_name, load_model, mlp_name
 
 KINDS = {"resid": "выход слоя (остаточный поток)", "attn": "выход внимания", "mlp": "выход MLP"}
 
@@ -146,8 +144,8 @@ def render(res: dict) -> str:
     return "\n".join(out)
 
 
-def main():
-    ap = argparse.ArgumentParser(description="Activation patching для Qwen (MLX)")
+def main(argv=None):
+    ap = argparse.ArgumentParser(prog="qwen-trace patch", description="Activation patching для Qwen (MLX)")
     ap.add_argument("model_path")
     ap.add_argument("--clean", required=True, help="промпт с правильным ответом")
     ap.add_argument("--corrupt", required=True, help="тот же промпт с изменённой деталью")
@@ -158,9 +156,9 @@ def main():
     ap.add_argument("--max-positions", type=int, default=64, help="сколько последних позиций перебирать")
     ap.add_argument("--thinking", action="store_true")
     ap.add_argument("--raw", action="store_true", help="не применять шаблон чата")
-    ap.add_argument("--run-dir", help="папка прогона trace_qwen.py: результат добавится в неё и в отчёт")
+    ap.add_argument("--run-dir", help="папка прогона trace: результат добавится в неё и в отчёт")
     ap.add_argument("--out", default="patching")
-    a = ap.parse_args()
+    a = ap.parse_args(argv)
 
     model, tok = load_model(a.model_path)
     kinds = ("resid", "attn", "mlp") if a.component == "all" else (a.component,)
@@ -176,8 +174,8 @@ def main():
         with open(out / "trace.log", "a", encoding="utf-8") as f:
             f.write(text + "\n")
         try:
-            import make_report
-            print("Отчёт пересобран:", make_report.build_report(out))
+            from . import report
+            print("Отчёт пересобран:", report.build_report(out))
         except ImportError:
             pass
 

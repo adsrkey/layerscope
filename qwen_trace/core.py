@@ -1,8 +1,7 @@
-#!/usr/bin/env python3
 """
-qcore.py — общее ядро инструментов: перехват вызовов модулей, вмешательства в прогон
-и мелкие численные утилиты. Сам ничего не запускает; его используют trace_qwen.py,
-layer_map.py, patching.py, tuned_lens.py и quant_compare.py.
+core — общее ядро инструментов: перехват вызовов модулей, вмешательства в прогон
+и мелкие численные утилиты. Сам ничего не запускает; его используют команды trace,
+layer-map, patch, tuned-lens и quant-compare.
 
 Главное здесь — Hooks. Это контекстный менеджер: на входе оборачивает __call__ у классов
 модулей языковой модели, на выходе возвращает всё как было.
@@ -19,7 +18,6 @@ import platform
 import random
 import re
 import sys
-from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 
@@ -130,21 +128,6 @@ class Hooks:
             return out
 
         return wrapped
-
-
-@contextmanager
-def grad_mode(lm):
-    """Режим, в котором через модель можно считать градиенты.
-
-    В обычном режиме слои линейного внимания используют готовое Metal-ядро, у которого
-    нет обратного прохода. В режиме train они считаются обычными операциями MLX —
-    результат тот же, но медленнее. Dropout в модели нет, так что ответ не меняется."""
-    was = getattr(lm, "training", False)
-    lm.train()
-    try:
-        yield
-    finally:
-        lm.train(was)
 
 
 # ───────────────── численные утилиты ─────────────────

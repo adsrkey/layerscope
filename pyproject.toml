@@ -1,6 +1,10 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "qwen-trace"
-version = "0.2.0"
+version = "0.3.0"
 description = "Журнал и причинный анализ одного прогона Qwen3.5/3.8 в MLX: от промпта до ответа"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -12,10 +16,16 @@ dependencies = [
 [project.optional-dependencies]
 dev = ["pytest>=8"]
 
+[project.scripts]
+qwen-trace = "qwen_trace.__main__:main"
+
+[tool.setuptools.packages.find]
+include = ["qwen_trace*"]
+
+[tool.setuptools.package-data]
+"qwen_trace.report" = ["template.html"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+pythonpath = ["."]
 addopts = "-q"
-
-[tool.setuptools]
-py-modules = ["qcore", "attribution", "trace_qwen", "layer_map", "patching",
-              "tuned_lens", "quant_compare", "make_report"]
