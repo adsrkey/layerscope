@@ -3,12 +3,16 @@
 attribution.py — причинные и градиентные методы поверх qcore.Hooks.
 
     direct_logit_attribution   вклад каждого слоя (внимание и MLP отдельно) в логиты любых токенов
-    token_attribution          вклад каждого токена промпта (gradient × input или
-                               integrated gradients) — работает и для линейных слоёв
-    atp                        attribution patching: оценка важности всех слоёв за один
-                               прямой и один обратный проход вместо полного перебора
+    occlusion_attribution      вклад каждого токена контекста: токен по очереди заменяется
+                               «нейтральным», и измеряется, насколько изменился выбор
+                               (прямое измерение, без градиентов; работает для всех слоёв)
     angular_distances          угловое расстояние между входом и выходом блока слоёв
                                (метрика выбора блока для удаления, Gromov et al., 2024)
+
+Экспериментальные, в отчёты не используются: token_attribution (gradient × input,
+integrated gradients) и atp (attribution patching). На Qwen3.8-27B они не совпали с прямыми
+измерениями: ранговая корреляция gradient × input с occlusion около 0,1, знак совпадает
+не чаще случайного, оценка слоёв по градиенту коррелирует с перебором на 0,12.
 """
 import math
 
@@ -47,7 +51,52 @@ def direct_logit_attribution(lm, parts: list, h_final: mx.array, cand_ids: list)
     return sel.tolist(), totals.tolist(), gap.item()
 
 
-# ───────────────── вклад токенов промпта ─────────────────
+# ───────────────── вклад токенов контекста: прямая подмена ─────────────────
+def occlusion_attribution(lm, ids: list, target: int, other: int = None, chunk: int = 8):
+    """Насколько каждый токен контекста подталкивал к target (а не к other).
+
+    Токен по очереди заменяется на «нейтральный» — средний эмбеддинг контекста, — и
+    измеряется, как изменилась метрика (разность логитов target и other на последней
+    позиции):  вклад = метрика(полный контекст) − метрика(токен заменён).
+    Положительный вклад — токен подталкивал к target, отрицательный — к other.
+
+    Это прямое измерение, а не оценка по градиенту: ему можно верить в той мере, в какой
+    «средний эмбеддинг» — разумная замена токена. Варианты считаются пачками по chunk
+    штук (одна пачка — один прямой проход). Возвращает (вклады по позициям, метрика)."""
+    L = len(ids)
+    x = mx.array([ids])
+    emb = lm.model.embed_tokens(x)                                          # (1, L, D)
+    base = emb.astype(F32).mean(axis=1, keepdims=True).astype(emb.dtype)    # (1, 1, D)
+    proj = unembed(lm)
+
+    def metric(e, xs):
+        out = lm(xs, inputs_embeds=e, skip_logits=True, return_hidden=True)
+        lg = proj(out.hidden_states[-1][:, -1, :]).astype(F32)             # (B, V)
+        return (lg[:, target] - lg[:, other]) if other is not None else lg[:, target]
+
+    # LanguageModel хранит позиции последнего вызова; пачка с B > 1 их переписывает
+    saved = (getattr(lm, "_position_ids", None), getattr(lm, "_rope_deltas", None))
+    try:
+        scores, full = [], None
+        for s0 in range(0, L, chunk):
+            idx = mx.arange(s0, min(s0 + chunk, L))
+            B = idx.shape[0]
+            hit = (mx.arange(L)[None, :] == idx[:, None])[..., None]        # (B, L, 1)
+            E = mx.where(hit, base, mx.broadcast_to(emb, (B, L, emb.shape[-1])))
+            # строка 0 — исходный контекст без замены: она считается в той же пачке, что и
+            # варианты, чтобы общая для всех строк погрешность умножения матриц сокращалась
+            E = mx.concatenate([emb, E], axis=0)
+            m = metric(E, mx.broadcast_to(x, (B + 1, L)))
+            scores.append(m[0] - m[1:])
+            full = m[0] if full is None else full
+        out = mx.concatenate(scores)
+        mx.eval(out, full)
+    finally:
+        lm._position_ids, lm._rope_deltas = saved
+    return out.tolist(), full.item()
+
+
+# ───────────────── вклад токенов промпта (градиенты, экспериментально) ─────────────────
 def token_attribution(lm, ids: list, target: int, other: int = None, ig_steps: int = 0):
     """Насколько каждый токен промпта повлиял на выбор target (а не other).
 
@@ -144,39 +193,49 @@ def atp(lm, hooks, full_ids: list, start: int, answer_ids: list) -> dict:
 
 
 # ───────────────── угловое расстояние между слоями ─────────────────
-def residual_stack(lm, ids: list) -> mx.array:
-    """Вектор последней позиции на входе каждого слоя и после последнего: (слоёв + 1, D)."""
+def residual_stack(lm, ids: list, max_pos: int = 128) -> mx.array:
+    """Векторы остаточного потока на входе каждого слоя и после последнего:
+    (слоёв + 1, позиций, D). Берутся последние max_pos позиций, кроме самой первой
+    (первый токен — «якорь» внимания с нетипичной геометрией)."""
     n_layers = len(lm.model.layers)
     x = mx.array([ids])
     out = lm(x, capture_layer_ids=list(range(n_layers)))
     hs = [lm.model.embed_tokens(x)] + list(out.hidden_states[:n_layers])
-    stack = mx.stack([h[0, -1].astype(F32) for h in hs])
+    stack = mx.stack([h[0, 1:][-max_pos:].astype(F32) for h in hs])
     mx.eval(stack)
     return stack
 
 
-def angular_distances(stacks: list, block_sizes: list) -> dict:
-    """d(l, l+n) = arccos(cos(h_l, h_{l+n})) / π, усреднённое по промптам.
+def angular_distances(stacks, block_sizes: list) -> dict:
+    """d(l, l+n) = arccos(cos(h_l, h_{l+n})) / π, усреднённое по позициям и промптам.
 
     Малое расстояние значит, что блок из n слоёв, начинающийся со слоя l, почти не
-    поворачивает вектор, — такой блок первым идёт в кандидаты на удаление."""
-    n_layers = stacks[0].shape[0] - 1
-    res = {}
-    for n in block_sizes:
-        if n < 1 or n > n_layers:
-            continue
-        acc = None
-        for s in stacks:
+    поворачивает вектор, — такой блок первым идёт в кандидаты на удаление.
+    stacks — итерируемое из массивов (слоёв + 1, позиций, D) (или (слоёв + 1, D) для одной
+    позиции); обрабатываются по одному, так что их не нужно держать в памяти все сразу."""
+    acc, count = {}, 0
+    for s in stacks:
+        s = s.astype(F32)
+        if s.ndim == 2:
+            s = s[:, None, :]
+        n_layers = s.shape[0] - 1
+        for n in block_sizes:
+            if n < 1 or n > n_layers:
+                continue
             a, b = s[:n_layers - n + 1], s[n:]
             cos = (a * b).sum(axis=-1) / (mx.linalg.norm(a, axis=-1) * mx.linalg.norm(b, axis=-1) + 1e-9)
-            d = mx.arccos(mx.clip(cos, -1.0, 1.0)) / math.pi
-            acc = d if acc is None else acc + d
-        vals = (acc / len(stacks)).tolist()
+            d = (mx.arccos(mx.clip(cos, -1.0, 1.0)) / math.pi).mean(axis=-1)    # по позициям
+            acc[n] = d if n not in acc else acc[n] + d
+        mx.eval(list(acc.values()))
+        count += 1
+    res = {}
+    for n, d in acc.items():
+        vals = (d / count).tolist()
         best = min(range(len(vals)), key=vals.__getitem__)
         res[str(n)] = {"dist": [round(v, 4) for v in vals], "best_start": best,
                        "best": round(vals[best], 4)}
     return res
 
 
-__all__ = ["direct_logit_attribution", "token_attribution", "atp", "residual_stack",
-           "angular_distances", "layer_name"]
+__all__ = ["direct_logit_attribution", "occlusion_attribution", "token_attribution", "atp",
+           "residual_stack", "angular_distances", "layer_name"]

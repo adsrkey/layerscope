@@ -291,7 +291,7 @@ def test_sampling_is_reproducible():
     assert len({tuple(run(s)) for s in range(4)}) > 1
 
 
-def test_token_attribution_ig_completeness():
+def test_gradient_attribution_ig_completeness_experimental():
     """Integrated gradients: сумма вкладов равна изменению метрики вдоль пути."""
     m, tok = calm_model()
     lm, ids = m.language_model, tok.encode("abcdef")
@@ -349,7 +349,7 @@ def make_batch():
     out = Path(tempfile.mkdtemp()) / "batch"
     prompts = ["What is 2+2?", "boom", "Name a color."]
     kw = dict(max_tokens=4, detail_steps=2, thinking=False, raw=False, skip_layers=[],
-              wstats=False, temperature=0.0, top_p=1.0, seed=0, token_attr=True, ig_steps=0,
+              wstats=False, temperature=0.0, top_p=1.0, seed=0, token_attr=True,
               lens=None)
     orig = T.run
 
@@ -396,8 +396,7 @@ def test_batch_mode_one_report_with_prompt_switcher():
     assert blocks["d-2"]["prompt"]["prompt"] == "Name a color."
     ok = [e for e in batch["entries"] if e["status"] == "ok"]
     assert all("first" in e and len(e["dla_abs"]["attn"]) == 8 for e in ok)
-    # «особенно важный слой» показывается только при заметном превышении среднего
-    assert all("map_top" not in e or e["map_top"]["ratio"] >= 1.5 for e in ok)
+    assert all("map_top" not in e for e in ok)               # эвристики «особенно важный слой» нет
     assert make_report.build_batch_report(out).exists()      # пересборка из папки, без модели
 
 
@@ -447,13 +446,13 @@ def test_layer_map_and_report():
     res = LM.build_map(m, tok, LM.DEFAULT_PROMPTS[:5], 4, 1, log=lambda *a: None, n_boot=200)
     assert len(res["layers"]) == 8 and res["version"] == 2
     for r in res["layers"]:
-        assert r["kl_lo"] <= r["kl"] <= r["kl_hi"] and "atp" in r and len(r["kl_per_prompt"]) == 5
-    assert -1 <= res["atp"]["corr"] <= 1
-    assert set(res["angular"]) >= {"1", "2", "4"}
+        assert r["kl_lo"] <= r["kl"] <= r["kl_hi"] and len(r["kl_per_prompt"]) == 5
+        assert "atp" not in r                              # градиентной оценки слоёв в карте нет
+    assert "atp" not in res and set(res["angular"]) >= {"1", "2", "4"}
     assert "95% интервал" in LM.render(res)
     fast = LM.build_map(m, tok, LM.DEFAULT_PROMPTS[:3], 4, 2, log=lambda *a: None, fast=True)
-    assert len(fast["layers"]) == 4 and "kl" not in fast["layers"][0] and "atp" in fast["layers"][0]
-    assert "Attribution patching" in LM.render(fast)
+    assert len(fast["layers"]) == 4 and "kl" not in fast["layers"][0] and fast["angular"]
+    assert "Attribution patching" not in LM.render(fast) and "Угловое расстояние" in LM.render(fast)
     d, _ = traced_run(max_tokens=3, detail_steps=1)
     LM.save_json(res, d / "layer_map.json")
     html = make_report.build_report(d).read_text(encoding="utf-8")
@@ -462,9 +461,84 @@ def test_layer_map_and_report():
 
 def test_angular_distance():
     a = mx.array([[1.0, 0.0], [1.0, 0.0], [0.0, 1.0], [-1.0, 0.0]])
-    r = A.angular_distances([a], [1, 2])
+    r = A.angular_distances([a], [1, 2])                     # одна позиция: форма (слоёв+1, D)
     assert r["1"]["dist"] == [0.0, 0.5, 0.5] and r["1"]["best_start"] == 0
     assert r["2"]["dist"] == [0.5, 1.0]
+    # две позиции усредняются: у второй блок ничего не меняет, у первой — как выше
+    b = mx.stack([a, mx.broadcast_to(a[:1], a.shape)], axis=1)       # (слоёв+1, 2, D)
+    r2 = A.angular_distances(iter([b]), [1])                         # итератор тоже годится
+    assert r2["1"]["dist"] == [0.0, 0.25, 0.25]
+
+
+def test_angular_distance_uses_all_positions():
+    m, tok = model()
+    st = A.residual_stack(m.language_model, tok.encode("abcdefgh"))
+    assert st.shape == (9, 7, 64)                            # слоёв+1, позиций без первой, D
+
+
+def test_attention_weights_match_real_attention():
+    """Восстановленные веса внимания, умноженные на значения, дают выход настоящего внимания
+    (то же самое проверено на Qwen3.8-27B: ошибка около 1% из-за bf16)."""
+    from mlx_vlm.models.qwen3_5 import language as lang
+    m, tok = model()
+    orig, errs = lang.scaled_dot_product_attention, []
+
+    def wrapped(queries, keys, values, cache, scale, mask, *a, **kw):
+        out = orig(queries, keys, values, cache, scale, mask, *a, **kw)
+        W = T.attention_weights(queries, keys, scale)
+        H, nq, _ = W.shape
+        v = values[0].astype(mx.float32)
+        v = mx.repeat(v, H // v.shape[0], axis=0) if v.shape[0] != H else v
+        real = out[0, :, -nq:, :].astype(mx.float32)
+        errs.append((mx.abs(W @ v - real).max() / (mx.abs(real).max() + 1e-9)).item())
+        return out
+
+    lang.scaled_dot_product_attention = wrapped
+    try:
+        lm = m.language_model
+        ids = tok.encode("What is the capital of France?")
+        cache = lm.make_cache()
+        lm(mx.array([ids]), cache=cache)                            # весь промпт сразу
+        lm(mx.array([[7]]), cache=cache)                            # один токен с кэшем
+    finally:
+        lang.scaled_dot_product_attention = orig
+    assert len(errs) == 4 and max(errs) < 5e-3, errs
+
+
+def test_occlusion_matches_direct_replacement():
+    """Подмена токена пачками (chunk) даёт то же, что подмена по одному."""
+    m, tok = model()
+    lm = m.language_model
+    ids = tok.encode("abcdefg hij")
+    x = mx.array([ids])
+    emb = lm.model.embed_tokens(x)
+    base = emb.astype(mx.float32).mean(axis=1, keepdims=True).astype(emb.dtype)
+
+    def metric(e):
+        lg = lm(x, inputs_embeds=e).logits[0, -1].astype(mx.float32)
+        return (lg[5] - lg[9]).item()
+
+    full = metric(emb)
+    expect = [full - metric(mx.concatenate([emb[:, :i], base, emb[:, i + 1:]], axis=1))
+              for i in range(len(ids))]
+    # допуск 1e-2: умножение матриц на (1, D) и на (B, D) даёт разницу порядка 4e-3 даже в float32
+    for chunk in (1, 3, 8):                                         # границы пачек в разных местах
+        got, value = A.occlusion_attribution(lm, ids, 5, 9, chunk=chunk)
+        assert abs(value - full) < 1e-2
+        assert max(abs(a - b) for a, b in zip(got, expect)) < 1e-2, chunk
+    # без соперника метрика — просто логит токена
+    only, _ = A.occlusion_attribution(lm, ids, 5)
+    assert len(only) == len(ids)
+
+
+def test_occlusion_does_not_disturb_generation_state():
+    m, tok = model()
+    lm = m.language_model
+    ids = tok.encode("abcdef")
+    lm(mx.array([ids]))
+    before = (lm._position_ids, lm._rope_deltas)
+    A.occlusion_attribution(lm, ids, 5, 9)
+    assert lm._position_ids is before[0] and lm._rope_deltas is before[1]
 
 
 def test_thinking_answer_offset():
@@ -539,7 +613,7 @@ def test_quantized_model_traces():
     assert of(ev, "token_attr") and of(ev, "dla")
     assert abs(of(ev, "dla")[0]["logit_sum"] - of(ev, "dla")[0]["logit_actual"]) < 5e-2
     res = LM.build_map(m, tok, LM.DEFAULT_PROMPTS[:2], 3, 1, log=lambda *a: None, fast=True)
-    assert res["atp"] and res["atp"]["prompts"] == 2
+    assert res["angular"]["1"]["best"] >= 0
 
 
 if __name__ == "__main__":

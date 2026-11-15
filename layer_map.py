@@ -9,9 +9,9 @@ layer_map.py — карта важности слоёв: что будет, ес
 Отдельно (карта для уже сделанного прогона — файл добавится в его папку):
     python layer_map.py /путь/к/модели --run-dir trace_logs/20261115_184500
     python layer_map.py /путь/к/модели --prompts prompts/extended.txt --tokens 12 --window 4
-    python layer_map.py /путь/к/модели --fast          # без перебора: секунды вместо минут
+    python layer_map.py /путь/к/модели --fast          # без перебора, только угловое расстояние
 
-Три независимые оценки (сходятся — выводу можно верить):
+Два измерения:
 
 1. Отключение (перебор). Модель отвечает как обычно (N токенов), затем тот же текст
    прогоняется с одним отключённым слоем, и на каждой позиции ответа сравнивается:
@@ -22,13 +22,14 @@ layer_map.py — карта важности слоёв: что будет, ес
    Для KL даётся 95% доверительный интервал (бутстреп по промптам): если интервалы двух
    слоёв пересекаются, по этим данным нельзя сказать, какой из них важнее.
 
-2. Attribution patching. Та же Δlog p, но оценённая по градиенту за один обратный
-   проход на промпт — в десятки раз быстрее перебора. Это линейное приближение;
-   корреляция с перебором печатается, чтобы было видно, насколько ему можно доверять.
+2. Угловое расстояние (Gromov et al., 2024). Насколько блок из n слоёв поворачивает
+   вектор остаточного потока (усреднено по всем позициям, кроме первой). Отвечает на другой
+   вопрос — какой блок удалять ЦЕЛИКОМ: важности отдельных слоёв не складываются, потому
+   что слои компенсируют друг друга.
 
-3. Угловое расстояние (Gromov et al., 2024). Насколько блок из n слоёв поворачивает
-   вектор последнего токена. Отвечает на другой вопрос — какой блок удалять ЦЕЛИКОМ:
-   важности отдельных слоёв не складываются, потому что слои компенсируют друг друга.
+Градиентную оценку важности слоёв (attribution patching) я убрал: на Qwen3.8-27B она
+коррелировала с перебором на 0,12, то есть не давала надёжной подсказки. Функция atp
+осталась в attribution.py как экспериментальная.
 
 С --thinking сравниваются токены ответа ПОСЛЕ блока рассуждений, а не его начало.
 
@@ -43,9 +44,9 @@ from pathlib import Path
 import mlx.core as mx
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from attribution import angular_distances, atp, residual_stack  # noqa: E402
+from attribution import angular_distances, residual_stack  # noqa: E402
 from qcore import (Hooks, bootstrap_ci, eos_ids, format_prompt, kl_div, layer_name,  # noqa: E402
-                   load_model, log_softmax, pearson)
+                   load_model, log_softmax)
 
 DEFAULT_PROMPTS = [
     # факты
@@ -194,34 +195,12 @@ def build_map(model, tok, prompts, n_tokens=8, window=1, thinking=False, raw=Fal
     with Hooks(lm) as hooks:
         hooks.keep_cache = False                 # кэша генерации тут нет: слой можно не считать
 
-        # 1. Градиентная оценка: один прямой и один обратный проход на промпт
-        log(f"\nAttribution patching: {len(cases)} промптов")
-        t0 = time.perf_counter()
-        est = {"layer": [0.0] * n_layers, "attn": [0.0] * n_layers, "mlp": [0.0] * n_layers}
-        atp_ok = 0
-        for case in cases:
-            try:
-                r = atp(lm, hooks, case["full"], case["start"], case["answer_ids"])
-            except Exception as e:               # нет градиентов — карта всё равно строится
-                log(f"  [не посчитано: {type(e).__name__}: {e}]")
-                break
-            atp_ok += 1
-            for k in est:
-                est[k] = [a + b for a, b in zip(est[k], r[k])]
-        atp_res = None
-        if atp_ok:
-            atp_res = {k: [round(v / atp_ok, 5) for v in vs] for k, vs in est.items()}
-            atp_res["prompts"] = atp_ok
-            for r in rows:
-                r["atp"] = round(sum(atp_res["layer"][r["first_layer"]:r["last_layer"] + 1]), 5)
-            log(f"  готово за {time.perf_counter() - t0:.0f} с")
-
-        # 2. Угловые расстояния между слоями (один прямой проход на промпт)
-        stacks = [residual_stack(lm, c["full"][:c["start"]]) for c in cases]
+        # 1. Угловые расстояния между слоями: один прямой проход на промпт, все позиции
+        log(f"\nУгловые расстояния: {len(cases)} промптов")
         sizes = sorted({n for n in (1, 2, 4, 8, 16, window) if n <= max(1, n_layers // 2)})
-        angular = angular_distances(stacks, sizes)
+        angular = angular_distances((residual_stack(lm, c["full"]) for c in cases), sizes)
 
-        # 3. Полный перебор: отключаем слои по одному (или блоками)
+        # 2. Полный перебор: отключаем слои по одному (или блоками)
         if not fast:
             log(f"\nОтключение слоёв: {len(starts)} вариантов x {len(cases)} промптов")
             t0 = time.perf_counter()
@@ -237,14 +216,11 @@ def build_map(model, tok, prompts, n_tokens=8, window=1, thinking=False, raw=Fal
                     el = time.perf_counter() - t0
                     log(f"  {done}/{len(rows)}  прошло {el:.0f} с, "
                         f"осталось ~{el / done * (len(rows) - done):.0f} с")
-            if atp_res:
-                atp_res["corr"] = round(pearson([r["atp"] for r in rows],
-                                                [r["dlogp"] for r in rows]), 3)
 
     return {"version": 2, "window": window, "tokens": n_tokens, "thinking": thinking,
             "fast": fast, "n_boot": n_boot,
             "prompts": [{"prompt": c["prompt"], "answer": c["answer"]} for c in cases],
-            "layers": rows, "atp": atp_res, "angular": angular}
+            "layers": rows, "angular": angular}
 
 
 def render(res: dict) -> str:
@@ -259,12 +235,11 @@ def render(res: dict) -> str:
     if not fast:
         vmax = max(r["kl"] for r in rows) or 1.0
         out.append(f"{'слой':>7} {'тип':<5} {'KL':>8} {'95% интервал':>19} {'сломано':>8} "
-                   f"{'p(исх.)':>8} {'Δlog p':>8} {'оценка':>8}  важность")
+                   f"{'p(исх.)':>8} {'Δlog p':>8}  важность")
         for r in rows:
-            est = f"{r['atp']:>8.3f}" if "atp" in r else f"{'—':>8}"
             out.append(f"{r['layers']:>7} {r['type']:<5} {r['kl']:>8.4f} "
                        f"[{r['kl_lo']:>7.4f}, {r['kl_hi']:>7.4f}] {r['broken']:>7.0%} "
-                       f"{r['p_orig']:>8.3f} {r['dlogp']:>8.3f} {est}  {bar(r['kl'], vmax)}")
+                       f"{r['p_orig']:>8.3f} {r['dlogp']:>8.3f}  {bar(r['kl'], vmax)}")
         line = lambda r: (f"  слой {r['layers']:>5} ({r['type']})  KL {r['kl']:.4f} "
                           f"[{r['kl_lo']:.4f}, {r['kl_hi']:.4f}]  сломано {r['broken']:.0%}")
         ranked = sorted(rows, key=lambda r: -r["kl"])
@@ -282,20 +257,13 @@ def render(res: dict) -> str:
                 sel = [r["kl"] for r in rows if r["type"] == kind]
                 if sel:
                     out.append(f"\nсредний KL, {name}: {sum(sel) / len(sel):.4f}  (слоёв: {len(sel)})")
-    a = res.get("atp")
-    if a:
-        out += ["", "-" * 78, "Attribution patching: оценка Δlog p по градиенту (один обратный проход)"]
-        if "corr" in a:
-            out.append(f"корреляция с полным перебором: {a['corr']:+.3f} "
-                       f"(ближе к 1 — оценке можно верить и запускать её вместо перебора)")
-        order = sorted(range(len(a["layer"])), key=lambda i: a["layer"][i])
-        out.append("сильнее всего навредит отключение (оценка):")
-        out += [f"  слой {i:>3}  Δlog p ≈ {a['layer'][i]:+.3f}   "
-                f"(внимание {a['attn'][i]:+.3f}, MLP {a['mlp'][i]:+.3f})" for i in order[:n]]
+    if fast:
+        out.append("Быстрый режим: перебор слоёв не запускался, есть только угловое расстояние.")
     ang = res.get("angular")
     if ang:
         out += ["", "-" * 78, "Угловое расстояние: какой блок слоёв меньше всего меняет вектор",
-                "(0 — блок ничего не делает, 1 — разворачивает вектор в обратную сторону)"]
+                "(0 — блок ничего не делает, 1 — разворачивает вектор в обратную сторону; "
+                "усреднено по всем позициям, кроме первой)"]
         for k, v in ang.items():
             s = v["best_start"]
             out.append(f"  блок из {int(k):>2} сл.: слои {s}–{s + int(k) - 1}, расстояние {v['best']:.4f}")
@@ -318,7 +286,7 @@ def main():
     ap.add_argument("--tokens", type=int, default=8, help="сколько токенов ответа сравнивать")
     ap.add_argument("--window", type=int, default=1, help="сколько соседних слоёв отключать за раз")
     ap.add_argument("--fast", action="store_true",
-                    help="без полного перебора: только градиентная оценка и угловые расстояния")
+                    help="без полного перебора слоёв: только угловое расстояние")
     ap.add_argument("--thinking", action="store_true",
                     help="режим рассуждений: сравниваются токены после блока рассуждений")
     ap.add_argument("--think-max", type=int, default=512, help="предел длины рассуждения в токенах")

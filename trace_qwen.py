@@ -41,7 +41,7 @@ from pathlib import Path
 
 import mlx.core as mx
 
-from attribution import direct_logit_attribution, token_attribution
+from attribution import direct_logit_attribution, occlusion_attribution
 from qcore import (Hooks, attn_name, eos_ids, format_prompt, kl_div, layer_name, layer_of,
                    lens_logits, load_model, log_softmax, mlp_name, pick_token, run_meta)
 
@@ -146,6 +146,25 @@ def weights_text(info: dict) -> str:
     if ws and "std" in ws:
         s += f"; веса: std={ws['std']} max|w|={ws['absmax']}"
     return s
+
+
+def attention_weights(queries, keys, scale, max_queries: int = 48):
+    """Веса softmax-внимания (H, nq, L) последних nq позиций запроса ко всему контексту.
+
+    Пересчитываются из запросов и ключей, которые получает функция внимания модели, с
+    причинной маской (токен видит себя и всё до себя). Должны совпадать с настоящими
+    весами: это проверено тестом (веса, умноженные на значения, дают выход настоящего
+    внимания) и на Qwen3.8-27B."""
+    nq = min(queries.shape[2], max_queries)
+    q = queries[0, :, -nq:, :].astype(mx.float32)          # (H, nq, D)
+    k = keys[0].astype(mx.float32)                         # (Hkv, L, D)
+    if k.shape[0] != q.shape[0]:
+        k = mx.repeat(k, q.shape[0] // k.shape[0], axis=0)
+    L = k.shape[1]
+    scores = (q @ k.transpose(0, 2, 1)) * scale            # (H, nq, L)
+    qpos = (L - nq) + mx.arange(nq)                        # абсолютные позиции запросов
+    causal = mx.arange(L)[None, :] <= qpos[:, None]
+    return mx.softmax(mx.where(causal[None], scores, -mx.inf), axis=-1)
 
 
 # ───────────────── перехват вызовов модулей ─────────────────
@@ -261,16 +280,8 @@ class Tracer:
     def _log_attention(self, queries, keys, scale):
         """Внимание последних позиций запроса (до 48) ко всем токенам контекста.
         Для подробного разбора по головам берётся только самая последняя позиция."""
-        nq = min(queries.shape[2], 48)
-        q = queries[0, :, -nq:, :].astype(mx.float32)      # (H, nq, D)
-        k = keys[0].astype(mx.float32)                     # (Hkv, L, D)
-        if k.shape[0] != q.shape[0]:
-            k = mx.repeat(k, q.shape[0] // k.shape[0], axis=0)
-        L = k.shape[1]
-        scores = (q @ k.transpose(0, 2, 1)) * scale        # (H, nq, L)
-        qpos = (L - nq) + mx.arange(nq)                    # абсолютные позиции запросов
-        causal = mx.arange(L)[None, :] <= qpos[:, None]    # токен видит себя и всё до себя
-        w_all = mx.softmax(mx.where(causal[None], scores, -mx.inf), axis=-1)   # (H, nq, L)
+        w_all = attention_weights(queries, keys, scale)    # (H, nq, L)
+        nq, L = w_all.shape[1], w_all.shape[2]
         w = w_all[:, -1, :]                                # (H, L): последний токен, по головам
         avg_all = w_all.mean(axis=0)                       # (nq, L): среднее по головам
         avg = avg_all[-1]
@@ -283,7 +294,7 @@ class Tracer:
         layer = self.stack[-1] if self.stack else "?"
         tk = lambda p: self.tokens[p] if p < len(self.tokens) else "?"
         items = [{"pos": p, "token": tk(p), "weight": round(avg_l[p], 4)} for p in top]
-        rec = {"heads": q.shape[0], "context": L, "top": items,
+        rec = {"heads": w_all.shape[0], "context": L, "top": items,
                "entropy": round(ent.item(), 4),
                "head_top": [[p, round(v, 4)] for p, v in
                             zip(head_pos.tolist(), head_w.tolist())],
@@ -297,7 +308,7 @@ class Tracer:
         self.j.event("attention", step=self.step, module=layer, **rec)
         pretty = "  ".join(f"{it['token']!r}:{it['weight']}" for it in items)
         self.j.text(f"{'  ' * len(self.stack)}ВНИМАНИЕ последнего токена "
-                    f"(среднее по {q.shape[0]} головам): {pretty}", echo=False)
+                    f"(среднее по {w_all.shape[0]} головам): {pretty}", echo=False)
 
 
 # ───────────────────────── вспомогательное ─────────────────────────
@@ -577,31 +588,25 @@ def lens_grid(lm, hidden, ids, tok, journal: Journal, step, lens=None, max_pos: 
 
 
 def prompt_attribution(lm, ctx_ids, tok, target: dict, other: dict, journal: Journal,
-                       ig_steps: int = 0, step: int = 0, n_prompt: int = None):
+                       step: int = 0, n_prompt: int = None):
     """Какие токены контекста сильнее всего повлияли на выбор токена на этом шаге.
 
     Контекст шага k — промпт плюс k уже выбранных токенов ответа, поэтому на поздних
-    шагах часть влияния приходится на собственные предыдущие токены модели."""
+    шагах часть влияния приходится на собственные предыдущие токены модели. Метод — прямая
+    подмена токена средним эмбеддингом (occlusion): градиентные оценки на этой модели не
+    совпали с прямыми измерениями и не используются."""
     n_prompt = len(ctx_ids) if n_prompt is None else n_prompt
-    # Считаем без кэша генерации, а LanguageModel хранит позиции последнего вызова:
-    # возвращаем их на место, чтобы анализ не влиял на сам прогон.
-    saved = (getattr(lm, "_position_ids", None), getattr(lm, "_rope_deltas", None))
     t0 = time.perf_counter()
     try:
-        attr, value, start = token_attribution(lm, ctx_ids, target["id"], other["id"], ig_steps)
+        attr, value = occlusion_attribution(lm, ctx_ids, target["id"], other["id"])
     except Exception as e:                           # не должно ломать прогон
         journal.text(f"\n[шаг {step}: вклад токенов не посчитан: {type(e).__name__}: {e}]")
         return
-    finally:
-        lm._position_ids, lm._rope_deltas = saved
-    method = f"integrated gradients, {ig_steps} шагов" if ig_steps else "gradient × input"
+    method = "подмена токена средним эмбеддингом (occlusion)"
     toks = [tok.decode([i]) for i in ctx_ids]
-    # для integrated gradients сумма вкладов обязана равняться изменению метрики вдоль пути
-    gap = None if start is None else round(abs(sum(attr) - (value - start)), 4)
     journal.event("token_attr", step=step, method=method, target=target, other=other,
                   scores=[round(v, 4) for v in attr], tokens=toks, n_prompt=n_prompt,
-                  metric=round(value, 4), completeness_gap=gap,
-                  seconds=round(time.perf_counter() - t0, 2))
+                  metric=round(value, 4), seconds=round(time.perf_counter() - t0, 2))
     journal.section(f"ЭТАП 4б. Шаг {step}: вклад токенов контекста в выбор токена")
     journal.text(f"метод: {method}; метрика — логит {target['token']!r} минус логит "
                  f"{other['token']!r} = {value:.3f}")
@@ -610,11 +615,8 @@ def prompt_attribution(lm, ctx_ids, tok, target: dict, other: dict, journal: Jou
         own = sum(abs(v) for v in attr[n_prompt:]) / total
         journal.text(f"контекст: {n_prompt} токенов промпта + {len(ctx_ids) - n_prompt} уже "
                      f"сгенерированных; на сгенерированные приходится {own:.0%} вклада")
-    if gap is not None:
-        journal.text(f"проверка: сумма вкладов расходится с изменением метрики на {gap} "
-                     f"(из {abs(value - start):.3f})" +
-                     ("  — много, увеличьте --ig-steps" if gap > 0.1 * max(abs(value - start), 1e-6) else ""))
-    journal.text("плюс — токен подталкивал к выбранному токену, минус — к альтернативе:")
+    journal.text("плюс — токен подталкивал к выбранному токену, минус — к альтернативе "
+                 "(насколько изменилась метрика, если токен заменить средним эмбеддингом):")
     for p in sorted(range(len(attr)), key=lambda p: -abs(attr[p]))[:12]:
         journal.text(f"  поз {p:3d} {toks[p]!r:>16}  {attr[p]:+.4f}" +
                      ("   (ответ)" if p >= n_prompt else ""))
@@ -637,8 +639,7 @@ def parse_layers(spec: str, n_layers: int) -> list:
 
 def generate(model, tok, ids, tracer: Tracer, journal: Journal, max_tokens: int,
              detail_steps: int, label: str = "", temperature: float = 0.0,
-             top_p: float = 1.0, seed: int = 0, lens=None, token_attr: bool = False,
-             ig_steps: int = 0) -> dict:
+             top_p: float = 1.0, seed: int = 0, lens=None, token_attr: bool = False) -> dict:
     """Один прогон. Возвращает text, ids, logp0 (распределение первого токена) и
     first — выбранный первый токен и его главный соперник."""
     lm = model.language_model
@@ -711,8 +712,7 @@ def generate(model, tok, ids, tracer: Tracer, journal: Journal, max_tokens: int,
         journal.event("sample", run=label.strip(" :") or "основной", step=step, ms=ms,
                       traced=detailed, chosen=chosen, candidates=best, **extra)
         if detailed and token_attr:
-            prompt_attribution(lm, ids + generated, tok, chosen, other, journal, ig_steps,
-                               step, len(ids))
+            prompt_attribution(lm, ids + generated, tok, chosen, other, journal, step, len(ids))
 
         if nxt in eos:
             journal.text("получен токен конца ответа — стоп")
@@ -772,7 +772,7 @@ def clean_timing(lm, ids, journal: Journal, n: int = 2):
 def run(model, tok, prompt: str, journal: Journal, max_tokens: int = 20,
         detail_steps: int = None, thinking: bool = False, raw: bool = False,
         skip_layers=(), wstats: bool = False, temperature: float = 0.0, top_p: float = 1.0,
-        seed: int = 0, token_attr: bool = True, ig_steps: int = 0, lens=None,
+        seed: int = 0, token_attr: bool = True, lens=None,
         model_path=None):
     lm = model.language_model
     n_layers = len(lm.model.layers)
@@ -782,7 +782,7 @@ def run(model, tok, prompt: str, journal: Journal, max_tokens: int = 20,
     journal.event("meta", **run_meta(
         model_path, prompt=prompt, max_tokens=max_tokens, detail_steps=detail_steps,
         thinking=thinking, raw=raw, skip_layers=skip_layers, temperature=temperature,
-        top_p=top_p, seed=seed, ig_steps=ig_steps,
+        top_p=top_p, seed=seed,
         tuned_lens=dict(lens.meta) if lens is not None else None))
 
     # 0. Модель
@@ -841,7 +841,7 @@ def run(model, tok, prompt: str, journal: Journal, max_tokens: int = 20,
             journal.section(f"ПРОГОН БЕЗ СЛОЁВ {skip_layers}")
         label = "Без слоёв: " if skip_layers else ""
         result = generate(model, tok, ids, tracer, journal, max_tokens, detail_steps, label,
-                          lens=lens, token_attr=token_attr, ig_steps=ig_steps, **sampling)
+                          lens=lens, token_attr=token_attr, **sampling)
         tracer.skip = set()
 
     # 5. Ответ
@@ -952,11 +952,8 @@ def main():
     ap.add_argument("--weight-stats", action="store_true",
                     help="считать статистику самих весов (среднее, std, max|w|) для каждого модуля")
     ap.add_argument("--no-token-attr", action="store_true",
-                    help="не считать вклад токенов контекста (экономит по обратному проходу "
-                         "на каждый подробный шаг)")
-    ap.add_argument("--ig-steps", type=int, default=0,
-                    help="вклад токенов через integrated gradients с таким числом шагов на каждый подробный шаг "
-                         "(0 — быстрый gradient × input)")
+                    help="не считать вклад токенов контекста (экономит несколько прямых "
+                         "проходов на каждый подробный шаг)")
     ap.add_argument("--tuned-lens", help="файл линзы из tuned_lens.py: точнее обычного logit lens")
     ap.add_argument("--layer-map", action="store_true",
                     help="после прогона построить карту важности слоёв (несколько минут)")
@@ -965,7 +962,7 @@ def main():
     ap.add_argument("--map-tokens", type=int, default=8, help="сколько токенов ответа сравнивать")
     ap.add_argument("--map-window", type=int, default=1, help="сколько слоёв отключать за раз")
     ap.add_argument("--map-fast", action="store_true",
-                    help="карта без полного перебора: только градиентная оценка и угловые расстояния")
+                    help="карта без полного перебора слоёв: только угловое расстояние")
     ap.add_argument("--no-report", action="store_true", help="не строить report.html")
     ap.add_argument("--out", default="trace_logs")
     a = ap.parse_args()
@@ -983,7 +980,7 @@ def main():
     run_kwargs = dict(max_tokens=a.max_tokens, detail_steps=a.detail_steps, thinking=a.thinking,
                       raw=a.raw, skip_layers=skip, wstats=a.weight_stats,
                       temperature=a.temperature, top_p=a.top_p, seed=a.seed,
-                      token_attr=not a.no_token_attr, ig_steps=a.ig_steps, lens=lens)
+                      token_attr=not a.no_token_attr, lens=lens)
 
     if a.batch is not None:
         import layer_map as LM
