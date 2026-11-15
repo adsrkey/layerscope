@@ -1,0 +1,143 @@
+# Расширенный набор для карты важности слоёв и сравнения моделей: 120 коротких промптов
+# по 10 типам задач, на русском и английском. Строки с # и пустые пропускаются.
+#   python layer_map.py /путь/к/модели --prompts prompts/extended.txt
+
+# ── факты ──
+Назови столицу Франции одним словом.
+What is the capital of Japan? Answer in one word.
+Кто написал роман «Война и мир»?
+Which planet is closest to the Sun? One word.
+В каком году человек впервые полетел в космос? Ответь только числом.
+What is the chemical symbol for gold?
+Какая самая длинная река в мире? Одно слово.
+Who painted the Mona Lisa?
+Сколько континентов на Земле? Ответь числом.
+What is the largest ocean on Earth? One word.
+Какой газ люди вдыхают, чтобы жить? Одно слово.
+In which country are the pyramids of Giza? One word.
+
+# ── арифметика ──
+Сколько будет 17 умножить на 6? Ответь только числом.
+What is 144 divided by 12? Answer with a number only.
+Сколько будет 250 минус 75? Только число.
+What is 9 squared? Number only.
+Сколько будет 3 в степени 4? Только число.
+What is 15% of 200? Number only.
+Сколько минут в трёх часах? Только число.
+What is 1000 minus 1? Number only.
+Сколько будет 48 плюс 37? Только число.
+What is the square root of 81? Number only.
+Сколько граммов в двух килограммах? Только число.
+What is 7 times 8? Number only.
+
+# ── последовательности и шаблоны ──
+Продолжи последовательность: 2, 4, 8, 16,
+Continue the sequence: 1, 1, 2, 3, 5, 8,
+Продолжи: понедельник, вторник, среда,
+Continue: A, C, E, G,
+Продолжи последовательность: 100, 90, 80, 70,
+Continue the sequence: 1, 4, 9, 16, 25,
+Продолжи: январь, февраль, март,
+Continue: red, orange, yellow, green,
+Продолжи последовательность: 3, 6, 9, 12,
+Continue: one, two, three, four,
+Продолжи: до, ре, ми, фа,
+Continue the sequence: 2, 3, 5, 7, 11,
+
+# ── код ──
+Напиши на Python функцию, которая возвращает сумму списка чисел.
+Write a one-line Python expression that reverses a string s.
+What does the SQL keyword DISTINCT do? One sentence.
+Напиши на JavaScript функцию, которая проверяет, чётное ли число.
+What is the output of print(len("hello")) in Python? Number only.
+Как в Python открыть файл для чтения? Одна строка кода.
+Write a Python list comprehension for squares of numbers 0 to 9.
+Что делает команда git status? Одно предложение.
+What is the time complexity of binary search? Short answer.
+Напиши на Python условие, которое проверяет, что список xs пуст.
+Which HTTP method is used to retrieve data? One word.
+Как объявить константу в JavaScript? Одно ключевое слово.
+
+# ── перевод ──
+Переведи на английский: «Сегодня хорошая погода».
+Translate to Russian: "The cat sleeps on the sofa."
+Переведи на немецкий слово «книга».
+Translate to French: "Good morning."
+Переведи на английский: «Я люблю читать».
+Translate to Spanish: "Thank you very much."
+Переведи на английский слово «окно».
+Translate to Russian: "Where is the station?"
+Переведи на французский слово «вода».
+Translate to German: "I am a student."
+Переведи на английский: «Сколько это стоит?»
+Translate to Russian: "See you tomorrow."
+
+# ── логика ──
+Все птицы умеют летать. Пингвин — птица. Умеет ли пингвин летать? Ответь кратко.
+If all bloops are razzies and all razzies are lazzies, are all bloops lazzies? Yes or no.
+Tom is taller than Ann. Ann is taller than Bob. Who is the shortest? One word.
+Если сегодня среда, какой день будет послезавтра? Одно слово.
+If it rains, the ground gets wet. The ground is dry. Did it rain? Yes or no.
+У Маши три яблока, она отдала одно. Сколько осталось? Только число.
+A is to the left of B. B is to the left of C. What is in the middle? One letter.
+Все кошки — животные. Мурка — кошка. Мурка — животное? Да или нет.
+Which is larger: one half or one third? Short answer.
+В комнате четыре угла, в каждом сидит кошка. Сколько кошек? Только число.
+If today is the 30th of April, what is the date tomorrow? Short answer.
+Петя старше Васи, Вася старше Коли. Кто самый старший? Одно слово.
+
+# ── здравый смысл ──
+Что тяжелее: килограмм ваты или килограмм железа? Ответь кратко.
+What do you use to cut paper? One word.
+Какого цвета небо в ясный день? Одно слово.
+What happens to ice when it is heated? Short answer.
+Что нужно взять с собой, если идёт дождь? Одно слово.
+Where do fish live? One word.
+Что люди обычно делают ночью? Одно слово.
+Which is hotter: fire or snow? One word.
+Чем люди едят суп? Одно слово.
+What do bees make? One word.
+Сколько ног у паука? Только число.
+What season comes after winter? One word.
+
+# ── язык и грамматика ──
+Исправь ошибку: «Я пошол в магазин».
+What is the plural of "mouse"? One word.
+Назови антоним слова «горячий».
+What is the past tense of "go"? One word.
+Назови синоним слова «большой».
+What is the opposite of "always"? One word.
+Поставь слово «стол» во множественное число.
+Which word is a noun: run, blue, table, quickly? One word.
+Какая часть речи слово «быстро»? Одно слово.
+What is the comparative form of "good"? One word.
+Сколько слогов в слове «молоко»? Только число.
+Correct the sentence: "She don't like apples."
+
+# ── классификация ──
+Is the sentence "I love this movie" positive or negative? One word.
+Отзыв: «Ужасный сервис, больше не приду». Он положительный или отрицательный? Одно слово.
+Is a tomato a fruit or a vegetable botanically? One word.
+Кит — это рыба или млекопитающее? Одно слово.
+Is "Python" in "I write Python code" an animal or a programming language? Short answer.
+Письмо «Вы выиграли миллион, перейдите по ссылке» — это спам или нет? Одно слово.
+Is 17 a prime number? Yes or no.
+Слово «бежать» — это глагол или существительное? Одно слово.
+Is the Sun a star or a planet? One word.
+Вопрос «Который час?» — он о времени или о месте? Одно слово.
+Is "Thank you so much!" polite or rude? One word.
+Золото — это металл или газ? Одно слово.
+
+# ── краткий пересказ и извлечение ──
+Сократи до трёх слов: «Сегодня утром шёл сильный дождь, и я опоздал на работу».
+Extract the city: "Anna moved to Berlin in 2019." One word.
+Извлеки год: «Компания основана в 1998 году в Москве». Только число.
+Summarize in three words: "The meeting was moved from Monday to Friday because of the holiday."
+Извлеки имя: «Вчера Сергей купил новую машину». Одно слово.
+Extract the price: "The ticket costs 45 dollars." Number only.
+Назови главную тему одним словом: «Учёные обнаружили новую планету у далёкой звезды».
+Extract the color: "She wore a bright green dress." One word.
+Извлеки число: «В классе учатся двадцать семь учеников». Цифрами.
+Give a one-word topic: "The team won the championship after a dramatic final."
+Извлеки город: «Конференция пройдёт в Казани в мае». Одно слово.
+Extract the name: "The book was written by Maria Lopez." Two words.

@@ -1,0 +1,21 @@
+[project]
+name = "qwen-trace"
+version = "0.2.0"
+description = "Журнал и причинный анализ одного прогона Qwen3.5/3.8 в MLX: от промпта до ответа"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "mlx>=0.32",
+    "mlx-vlm>=0.7.12",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.setuptools]
+py-modules = ["qcore", "attribution", "trace_qwen", "layer_map", "patching",
+              "tuned_lens", "quant_compare", "make_report"]
