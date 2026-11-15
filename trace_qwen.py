@@ -19,7 +19,8 @@ trace_qwen.py — полный журнал одного прогона моде
     layer_map.json  карта важности слоёв (только с --layer-map)
     report.html     интерактивный отчёт: открывается двойным щелчком, работает без сети
 
-Что считается для подробных шагов (--detail-steps):
+Что считается для подробных шагов (--detail-steps; по умолчанию — все токены ответа,
+но не больше --max-tokens):
     каждый вызов модуля, logit lens (и tuned lens, если дана), внимание по головам,
     разложение итогового логита по слоям (DLA), вклад токенов контекста (промпт и уже
     выбранные токены ответа) в выбор каждого токена.
@@ -769,13 +770,15 @@ def clean_timing(lm, ids, journal: Journal, n: int = 2):
 
 
 def run(model, tok, prompt: str, journal: Journal, max_tokens: int = 20,
-        detail_steps: int = 1, thinking: bool = False, raw: bool = False,
+        detail_steps: int = None, thinking: bool = False, raw: bool = False,
         skip_layers=(), wstats: bool = False, temperature: float = 0.0, top_p: float = 1.0,
         seed: int = 0, token_attr: bool = True, ig_steps: int = 0, lens=None,
         model_path=None):
     lm = model.language_model
     n_layers = len(lm.model.layers)
     skip_layers = sorted(set(skip_layers))
+    if detail_steps is None:             # по умолчанию — все токены ответа (и токен конца)
+        detail_steps = max_tokens
     journal.event("meta", **run_meta(
         model_path, prompt=prompt, max_tokens=max_tokens, detail_steps=detail_steps,
         thinking=thinking, raw=raw, skip_layers=skip_layers, temperature=temperature,
@@ -933,8 +936,11 @@ def main():
                          "переключателем промптов. Промпт из командной строки добавляется первым")
     ap.add_argument("--max-prompts", type=int, help="в пакетном режиме взять только первые N промптов")
     ap.add_argument("--max-tokens", type=int, default=20)
-    ap.add_argument("--detail-steps", type=int, default=3,
-                    help="для скольких первых шагов писать каждый вызов модуля")
+    ap.add_argument("--detail-steps", type=int, default=None,
+                    help="для скольких первых шагов генерации делать подробный разбор (каждый "
+                         "вызов модуля, logit lens, вклад слоёв, внимание, вклад токенов). По "
+                         "умолчанию — для всех токенов ответа и токена конца, то есть до "
+                         "--max-tokens; меньшее число экономит время и размер отчёта")
     ap.add_argument("--skip-layers", default="",
                     help="отключить слои, нумерация с нуля: 35  или  3,35,40-43")
     ap.add_argument("--thinking", action="store_true", help="включить режим рассуждений")

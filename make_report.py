@@ -544,7 +544,10 @@ function renderResid(){
 
 function stepPicker(){
   if (lensSteps.length < 2) return '';
-  return `<div class="legend">шаг генерации: ${lensSteps.map(s => `<button class="${S.lens===s?'on':''}" data-lens="${s}">${s===0?'0 (промпт)':s}</button>`).join(' ')}</div>`;
+  const nAns = D.answer ? D.answer.ids.length : -1, hasStop = lensSteps.includes(nAns) && nAns>0;      // шаг, на котором выбран токен конца ответа
+  const label = s => s===0 ? '0 (промпт)' : (hasStop && s===nAns ? s + ' (конец)' : s);
+  const last = lensSteps[lensSteps.length-1], cut = D.samples.length > last+1 ? `<span class="muted"> · подробно разобраны шаги 0–${last} из ${D.samples.length}; больше — через --detail-steps</span>` : (!hasStop && MP.max_tokens && D.samples.length >= MP.max_tokens ? `<span class="muted"> · ответ оборван по --max-tokens (${MP.max_tokens}); чтобы разобрать его целиком, увеличьте значение</span>` : '');
+  return `<div class="legend">шаг генерации: ${lensSteps.map(s => `<button class="${S.lens===s?'on':''}" data-lens="${s}">${label(s)}</button>`).join(' ')}${hasStop ? `<span class="muted"> · шаг ${nAns} — выбор токена конца ответа, в текст он не входит</span>` : ''}${cut}</div>`;
 }
 
 // ───────────── Logit lens ─────────────

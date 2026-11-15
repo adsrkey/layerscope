@@ -183,6 +183,22 @@ def test_dla_is_exact():
         assert e["residual_gap"] < 1e-3
 
 
+def test_every_answer_token_is_detailed_by_default():
+    """Без --detail-steps разбирается каждый токен ответа (и токен конца), а не первые N."""
+    _, ev = traced_run(max_tokens=7)
+    samples = of(ev, "sample")
+    n = len(samples)
+    assert n >= 2
+    for kind in ("dla", "token_attr", "residual", "logit_lens"):
+        steps = {e["step"] for e in of(ev, kind)}
+        assert steps == set(range(n)), kind
+    assert all(e["traced"] for e in samples)
+    assert of(ev, "meta")[0]["params"]["detail_steps"] == 7        # записано итоговое значение
+    # явное ограничение по-прежнему работает
+    _, ev2 = traced_run(max_tokens=7, detail_steps=2)
+    assert {e["step"] for e in of(ev2, "dla")} == {0, 1}
+
+
 def test_dla_any_pair_of_candidates():
     """Вклады посчитаны для пяти кандидатов: сумма по компонентам равна настоящему логиту
     каждого из них, а разность любой пары получается вычитанием."""
