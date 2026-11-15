@@ -22,7 +22,7 @@ def build_data(run_dir) -> dict:
         return next((e for e in ev if e["kind"] == kind), None)
 
     D = {"run": run_dir.name, "model": first("model"), "prompt": first("prompt"),
-         "meta": first("meta"), "timing": first("timing"), "token_attr": first("token_attr"),
+         "meta": first("meta"), "timing": first("timing"),
          "tokens": first("tokens"), "embeddings": first("embeddings"),
          "weights": first("weights"), "ablation": first("ablation")}
     answers = [e for e in ev if e["kind"] == "answer"]
@@ -52,6 +52,9 @@ def build_data(run_dir) -> dict:
     for v in lens.values():
         v.sort(key=lambda r: r["layer"])
     D["lens"], D["attention"], D["resid"] = lens, attn, resid
+    # вклад токенов контекста по шагам (в старых журналах он был один, без номера шага)
+    D["token_attrs"] = {str(e.get("step", 0)): {k: v for k, v in e.items() if k not in ("n", "kind")}
+                        for e in ev if e["kind"] == "token_attr"}
     D["dla"] = {str(e["step"]): {k: e[k] for k in ("target", "other", "components", "logit_sum",
                                                    "logit_actual", "residual_gap")}
                 for e in ev if e["kind"] == "dla"}
@@ -133,6 +136,7 @@ button:hover{border-color:var(--ink3)} button.on{background:var(--ink);color:var
   padding:2px 7px;font-size:13px;cursor:pointer;line-height:1.25}
 .chip small{font-size:10px;color:var(--ink3)} .chip.sp{background:transparent;border:1px dashed var(--ink3);color:var(--ink2)}
 .chip.on{border-color:var(--ink);outline:1px solid var(--ink)}
+.chip.ans{border:1px solid var(--violet)}
 .facts{display:flex;flex-wrap:wrap;gap:8px;margin:12px 0 0}
 .fact{background:var(--chip);border-radius:8px;padding:6px 12px}
 .fact b{display:block;font-size:16px;line-height:1.2} .fact span{font-size:11px;color:var(--ink3)}
@@ -707,19 +711,23 @@ function renderDla(){
      <p class="muted small">Проверка: сумма вкладов в логит ${f(A.logit_sum,3)}, настоящий логит ${f(A.logit_actual,3)}. Разложение показывает прямой вклад в выход; косвенное влияние слоя через следующие слои видно в карте важности и патчинге.</p>`;
 }
 
-// ───────────── Вклад токенов промпта ─────────────
+// ───────────── Вклад токенов контекста ─────────────
 function renderTokAttr(){
-  const A = D.token_attr, sec = $('#s-tokattr');
-  if (!A) { sec.innerHTML = hdr('', 'Вклад токенов промпта', '') + empty('Нет данных: прогон был с --no-token-attr или градиенты посчитать не удалось (причина — в trace.log).'); return; }
-  const mxv = Math.max(...A.scores.map(Math.abs)) || 1;
-  const chips = A.scores.map((v,i) => `<span class="chip${isSpecial(toks[i]||'')?' sp':''}" data-tok="${i}" style="background:${dvg(v/mxv*0.75)}"${tip(`поз ${i}: ${(toks[i]||'').replace(/\n/g,'↵')}\nвклад ${sgn(v,4)}`)}>${vis(toks[i]||'')}<small>${sgn(v,2)}</small></span>`).join('');
+  const sec = $('#s-tokattr'), A = S.lens==null ? null : D.token_attrs[String(S.lens)];
+  if (!A) { sec.innerHTML = hdr('', 'Вклад токенов контекста', '') + empty('Нет данных: прогон был с --no-token-attr, этот шаг не подробный (--detail-steps) или градиенты посчитать не удалось (причина — в trace.log).'); return; }
+  const T = A.tokens || toks, np = A.n_prompt != null ? A.n_prompt : A.scores.length, st = A.step || 0;
+  const mxv = Math.max(...A.scores.map(Math.abs)) || 1, tot = sum(A.scores.map(Math.abs)) || 1;
+  const own = sum(A.scores.slice(np).map(Math.abs)) / tot;
+  const chips = A.scores.map((v,i) => `<span class="chip${isSpecial(T[i]||'')?' sp':''}${i>=np?' ans':''}"${i<np?` data-tok="${i}"`:''} style="background:${dvg(v/mxv*0.75)}"${tip(`${i>=np?'токен ответа':'токен промпта'}, поз ${i}: ${(T[i]||'').replace(/\n/g,'↵')}\nвклад ${sgn(v,4)}`)}>${vis(T[i]||'')}<small>${sgn(v,2)}</small></span>`).join('');
   const top = A.scores.map((v,i)=>({v,i})).sort((a,b)=>Math.abs(b.v)-Math.abs(a.v)).slice(0,8);
-  const trs = top.map(r => `<tr><td class="num">${r.i}</td><td class="mono">${vis(toks[r.i]||'')}</td><td class="num">${sgn(r.v,4)}</td><td style="width:240px"><span class="bar" style="width:${Math.abs(r.v)/mxv*220}px;background:var(${r.v>=0?'--blue':'--red'})"></span></td></tr>`).join('');
+  const trs = top.map(r => `<tr><td class="num">${r.i}</td><td class="mono">${vis(T[r.i]||'')}</td><td>${r.i>=np?'ответ':'промпт'}</td><td class="num">${sgn(r.v,4)}</td><td style="width:240px"><span class="bar" style="width:${Math.abs(r.v)/mxv*220}px;background:var(${r.v>=0?'--blue':'--red'})"></span></td></tr>`).join('');
   const gap = A.completeness_gap!=null ? `<p class="muted small">Проверка метода: сумма вкладов расходится с изменением метрики на ${f(A.completeness_gap,3)}. Если это много, увеличьте --ig-steps.</p>` : '';
-  sec.innerHTML = hdr('', 'Вклад токенов промпта в первый токен ответа', `Карта внимания есть только у слоёв полного внимания, а их ${TY.filter(t=>t==='A').length} из ${NL}. Этот метод работает через градиент и учитывает все слои: показывает, какие токены промпта подтолкнули модель выбрать <span class="mono">${vis(A.target.token)}</span>, а не <span class="mono">${vis(A.other.token)}</span>.`) +
+  const ctx = np < A.scores.length ? `На шаге ${st} контекст — это ${np} токенов промпта и ${A.scores.length-np} уже выбранных токенов ответа (фиолетовая рамка). ` : '';
+  sec.innerHTML = hdr('', 'Вклад токенов контекста в выбор токена', `Карта внимания есть только у слоёв полного внимания, а их ${TY.filter(t=>t==='A').length} из ${NL}. Этот метод работает через градиент и учитывает все слои: показывает, какие токены подтолкнули модель выбрать <span class="mono">${vis(A.target.token)}</span>, а не <span class="mono">${vis(A.other.token)}</span>. ${ctx}`) + stepPicker() +
+    (np < A.scores.length ? `<div class="tiles"><div class="tile"><b>${pct(own)}</b><span>вклада — на уже сгенерированные токены</span></div><div class="tile"><b>${pct(1-own)}</b><span>вклада — на промпт</span></div></div>` : '') +
     `<div class="chips">${chips}</div>
      <div class="legend"><span><i style="background:var(--blue)"></i>подталкивал к выбранному токену</span><span><i style="background:var(--red)"></i>подталкивал к сопернику</span><span class="muted">метод: ${esc(A.method)} · ${f(A.seconds,1)} с</span></div>
-     <table><tr><th class="num">поз</th><th>токен</th><th class="num">вклад</th><th></th></tr>${trs}</table>${gap}
+     <table><tr><th class="num">поз</th><th>токен</th><th>где</th><th class="num">вклад</th><th></th></tr>${trs}</table>${gap}
      <p class="muted small">Gradient × input — линейное приближение в одной точке: знак и порядок величин надёжны, точные числа — нет. Для точных значений запустите с --ig-steps 32.</p>`;
 }
 
@@ -886,7 +894,7 @@ function act(el){
   if (el.dataset.layer != null) { S.layer = +el.dataset.layer; renderLayers(); renderAttn(); }
   else if (el.dataset.tok != null) { S.tok = +el.dataset.tok; renderTokens(); renderEmb(); }
   else if (el.dataset.hl != null) { S.hl = +el.dataset.hl; renderAttn(); }
-  else if (el.dataset.lens != null) { S.lens = +el.dataset.lens; renderLayers(); renderResid(); renderLens(); renderDla(); renderAttn(); }
+  else if (el.dataset.lens != null) { S.lens = +el.dataset.lens; renderLayers(); renderResid(); renderLens(); renderDla(); renderTokAttr(); renderAttn(); }
   else if (el.dataset.step != null) { S.sstep = +el.dataset.step; renderSample(); }
   else if (el.dataset.metric != null) { S.metric = el.dataset.metric; renderLayers(); renderMap(); }
   else if (el.dataset.go) { const t = document.getElementById(el.dataset.go); if (t) t.scrollIntoView(); }

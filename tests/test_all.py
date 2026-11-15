@@ -137,6 +137,40 @@ def test_run_events_and_meta():
     assert (d / "trace.log").stat().st_size > 0
 
 
+def test_token_attribution_every_detailed_step():
+    """Вклад токенов считается на каждом подробном шаге; контекст растёт вместе с ответом."""
+    _, tok = model()
+    _, ev = traced_run(max_tokens=5, detail_steps=3)
+    ta = of(ev, "token_attr")
+    n_prompt = len(of(ev, "tokens")[0]["ids"])
+    steps = [e["step"] for e in ta]
+    assert steps and steps == list(range(len(steps)))
+    answer = [tok.decode([i]) for i in of(ev, "answer")[0]["ids"]]
+    for e in ta:
+        assert e["n_prompt"] == n_prompt
+        assert len(e["scores"]) == len(e["tokens"]) == n_prompt + e["step"]
+        assert e["tokens"][n_prompt:] == answer[:e["step"]]       # контекст = промпт + выбранное
+
+
+def test_token_attribution_does_not_change_answer():
+    """Анализ работает без кэша, но не должен влиять на сам прогон."""
+    with_attr = of(traced_run(max_tokens=6, detail_steps=3)[1], "answer")[0]["ids"]
+    without = of(traced_run(max_tokens=6, detail_steps=3, token_attr=False)[1], "answer")[0]["ids"]
+    assert with_attr == without
+
+
+def test_report_old_single_token_attr_format():
+    """Журналы старого формата (один token_attr без шага и токенов) по-прежнему читаются."""
+    d, ev = traced_run(max_tokens=2, detail_steps=1)
+    lines = [json.loads(l) for l in open(d / "events.jsonl", encoding="utf-8")]
+    with open(d / "events.jsonl", "w", encoding="utf-8") as f:
+        for e in lines:
+            if e["kind"] == "token_attr":
+                e = {k: v for k, v in e.items() if k not in ("step", "tokens", "n_prompt")}
+            f.write(json.dumps(e, ensure_ascii=False) + "\n")
+    assert make_report.build_data(d)["token_attrs"]["0"]["scores"]
+
+
 def test_dla_is_exact():
     """Сумма вкладов компонент равна настоящему логиту выбранного токена."""
     _, ev = traced_run(max_tokens=3, detail_steps=2)

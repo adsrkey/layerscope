@@ -18,7 +18,8 @@ trace_qwen.py — полный журнал одного прогона моде
 
 Что считается для подробных шагов (--detail-steps):
     каждый вызов модуля, logit lens (и tuned lens, если дана), внимание по головам,
-    разложение итогового логита по слоям (DLA), вклад токенов промпта в ответ.
+    разложение итогового логита по слоям (DLA), вклад токенов контекста (промпт и уже
+    выбранные токены ответа) в выбор каждого токена.
 
 Рассчитан на Qwen3.5/3.8 в формате MLX (mlx-vlm, model_type "qwen3_5").
 """
@@ -487,32 +488,48 @@ def logit_attribution(lm, tracer: Tracer, emb_last, h_final, target: dict, other
         journal.text(f"  {where:<18} вклад в разность {c['diff']:+8.3f}   в логит {c['logit']:+8.3f}")
 
 
-def prompt_attribution(lm, ids, tok, target: dict, other: dict, journal: Journal,
-                       ig_steps: int = 0):
-    """Какие токены промпта сильнее всего повлияли на первый токен ответа."""
+def prompt_attribution(lm, ctx_ids, tok, target: dict, other: dict, journal: Journal,
+                       ig_steps: int = 0, step: int = 0, n_prompt: int = None):
+    """Какие токены контекста сильнее всего повлияли на выбор токена на этом шаге.
+
+    Контекст шага k — промпт плюс k уже выбранных токенов ответа, поэтому на поздних
+    шагах часть влияния приходится на собственные предыдущие токены модели."""
+    n_prompt = len(ctx_ids) if n_prompt is None else n_prompt
+    # Считаем без кэша генерации, а LanguageModel хранит позиции последнего вызова:
+    # возвращаем их на место, чтобы анализ не влиял на сам прогон.
+    saved = (getattr(lm, "_position_ids", None), getattr(lm, "_rope_deltas", None))
     t0 = time.perf_counter()
     try:
-        attr, value, start = token_attribution(lm, ids, target["id"], other["id"], ig_steps)
+        attr, value, start = token_attribution(lm, ctx_ids, target["id"], other["id"], ig_steps)
     except Exception as e:                           # не должно ломать прогон
-        journal.text(f"\n[вклад токенов промпта не посчитан: {type(e).__name__}: {e}]")
+        journal.text(f"\n[шаг {step}: вклад токенов не посчитан: {type(e).__name__}: {e}]")
         return
+    finally:
+        lm._position_ids, lm._rope_deltas = saved
     method = f"integrated gradients, {ig_steps} шагов" if ig_steps else "gradient × input"
-    toks = [tok.decode([i]) for i in ids]
+    toks = [tok.decode([i]) for i in ctx_ids]
     # для integrated gradients сумма вкладов обязана равняться изменению метрики вдоль пути
     gap = None if start is None else round(abs(sum(attr) - (value - start)), 4)
-    journal.event("token_attr", method=method, target=target, other=other,
-                  scores=[round(v, 4) for v in attr], metric=round(value, 4),
-                  completeness_gap=gap, seconds=round(time.perf_counter() - t0, 2))
-    journal.section("ЭТАП 4б. Вклад токенов промпта в первый токен ответа")
+    journal.event("token_attr", step=step, method=method, target=target, other=other,
+                  scores=[round(v, 4) for v in attr], tokens=toks, n_prompt=n_prompt,
+                  metric=round(value, 4), completeness_gap=gap,
+                  seconds=round(time.perf_counter() - t0, 2))
+    journal.section(f"ЭТАП 4б. Шаг {step}: вклад токенов контекста в выбор токена")
     journal.text(f"метод: {method}; метрика — логит {target['token']!r} минус логит "
                  f"{other['token']!r} = {value:.3f}")
+    if len(ctx_ids) > n_prompt:
+        total = sum(abs(v) for v in attr) or 1.0
+        own = sum(abs(v) for v in attr[n_prompt:]) / total
+        journal.text(f"контекст: {n_prompt} токенов промпта + {len(ctx_ids) - n_prompt} уже "
+                     f"сгенерированных; на сгенерированные приходится {own:.0%} вклада")
     if gap is not None:
         journal.text(f"проверка: сумма вкладов расходится с изменением метрики на {gap} "
                      f"(из {abs(value - start):.3f})" +
                      ("  — много, увеличьте --ig-steps" if gap > 0.1 * max(abs(value - start), 1e-6) else ""))
-    journal.text("плюс — токен подталкивал к выбранному ответу, минус — к альтернативе:")
+    journal.text("плюс — токен подталкивал к выбранному токену, минус — к альтернативе:")
     for p in sorted(range(len(attr)), key=lambda p: -abs(attr[p]))[:12]:
-        journal.text(f"  поз {p:3d} {toks[p]!r:>16}  {attr[p]:+.4f}")
+        journal.text(f"  поз {p:3d} {toks[p]!r:>16}  {attr[p]:+.4f}" +
+                     ("   (ответ)" if p >= n_prompt else ""))
 
 
 # ───────────────────────── этапы ─────────────────────────
@@ -532,7 +549,8 @@ def parse_layers(spec: str, n_layers: int) -> list:
 
 def generate(model, tok, ids, tracer: Tracer, journal: Journal, max_tokens: int,
              detail_steps: int, label: str = "", temperature: float = 0.0,
-             top_p: float = 1.0, seed: int = 0, lens=None) -> dict:
+             top_p: float = 1.0, seed: int = 0, lens=None, token_attr: bool = False,
+             ig_steps: int = 0) -> dict:
     """Один прогон. Возвращает text, ids, logp0 (распределение первого токена) и
     first — выбранный первый токен и его главный соперник."""
     lm = model.language_model
@@ -593,6 +611,9 @@ def generate(model, tok, ids, tracer: Tracer, journal: Journal, max_tokens: int,
                      f"   [энтропия {extra['entropy']}, токенов в nucleus(0.95): {extra['nucleus95']}]")
         journal.event("sample", run=label.strip(" :") or "основной", step=step, ms=ms,
                       traced=detailed, chosen=chosen, candidates=best, **extra)
+        if detailed and token_attr:
+            prompt_attribution(lm, ids + generated, tok, chosen, other, journal, ig_steps,
+                               step, len(ids))
 
         if nxt in eos:
             journal.text("получен токен конца ответа — стоп")
@@ -719,10 +740,7 @@ def run(model, tok, prompt: str, journal: Journal, max_tokens: int = 20,
             journal.section(f"ПРОГОН БЕЗ СЛОЁВ {skip_layers}")
         label = "Без слоёв: " if skip_layers else ""
         result = generate(model, tok, ids, tracer, journal, max_tokens, detail_steps, label,
-                          lens=lens, **sampling)
-        if token_attr and result["first"]:       # пока слои ещё отключены: объясняем этот же прогон
-            prompt_attribution(lm, ids, tok, result["first"]["target"],
-                               result["first"]["other"], journal, ig_steps)
+                          lens=lens, token_attr=token_attr, ig_steps=ig_steps, **sampling)
         tracer.skip = set()
 
     # 5. Ответ
@@ -770,9 +788,10 @@ def main():
     ap.add_argument("--weight-stats", action="store_true",
                     help="считать статистику самих весов (среднее, std, max|w|) для каждого модуля")
     ap.add_argument("--no-token-attr", action="store_true",
-                    help="не считать вклад токенов промпта (экономит один обратный проход)")
+                    help="не считать вклад токенов контекста (экономит по обратному проходу "
+                         "на каждый подробный шаг)")
     ap.add_argument("--ig-steps", type=int, default=0,
-                    help="вклад токенов через integrated gradients с таким числом шагов "
+                    help="вклад токенов через integrated gradients с таким числом шагов на каждый подробный шаг "
                          "(0 — быстрый gradient × input)")
     ap.add_argument("--tuned-lens", help="файл линзы из tuned_lens.py: точнее обычного logit lens")
     ap.add_argument("--layer-map", action="store_true",
