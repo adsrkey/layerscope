@@ -91,6 +91,9 @@ details{margin-top:10px} summary{cursor:pointer;color:var(--ink2);font-size:13px
   font-size:12px;line-height:1.4;white-space:pre;max-width:420px;display:none;box-shadow:0 4px 14px rgba(0,0,0,.25)}
 .bar{display:inline-block;height:8px;border-radius:2px;background:var(--blue);vertical-align:middle}
 .empty{color:var(--ink3);padding:14px;border:1px dashed var(--line);border-radius:8px}
+/* режим снимка для документации (см. #shot=... в конце скрипта): виден один раздел без меню */
+.shot nav{display:none} .shot main{padding:12px 16px}
+.shot main > section{display:none !important} .shot main > section.on{display:block !important;margin:0}
 </style>
 </head>
 <body>
@@ -462,7 +465,7 @@ function stepPicker(){
 // ───────────── Logit lens ─────────────
 function lensGrid(){
   const G = D.lens_grid;
-  if (!G) return '<div class="note">Сетки по всем позициям промпта в этом журнале нет — пересоберите прогон новой версией trace_qwen.py.</div>';
+  if (!G) return '<div class="note">Сетки по всем позициям промпта в этом журнале нет — пересоберите прогон новой версией layerscope.</div>';
   if (S.lens!==0) return '<h3>По всем позициям промпта</h3><p class="muted small">Сетка «слой × позиция» строится для шага 0 — на нём модель читает весь промпт сразу. Выберите шаг 0.</p>';
   const P = G.positions.length, NG = G.top.length, padL = 54, W = 1100, cw = Math.min(54, (W-padL-8)/P), ch = 13, nextMode = S.lg==='next';
   const cut = Math.max(2, Math.floor(cw/6.5));
@@ -513,7 +516,7 @@ function renderLens(){
   $('#s-lens').innerHTML = hdr('', 'Шаг 5. Logit lens: когда «созревает» ответ', 'Если остановить модель после любого слоя, пропустить вектор через финальную норму и lm_head, получится «промежуточный ответ». Так видно, как догадка превращается в итог: от пробелов и знаков препинания до конкретного слова.') + stepPicker() +
     `<div class="tiles"><div class="tile"><b class="mono">${vis(fin)}</b><span>итоговый токен</span></div><div class="tile"><b>${settle==null?'—':settle}</b><span>слой, с которого он лидирует</span></div><div class="tile"><b>${top10<0?'—':top10}</b><span>слой, где он попал в топ-10</span></div>${tuned?`<div class="tile"><b>${tsettle==null?'—':tsettle}</b><span>слой, с которого он лидирует по tuned lens</span></div>`:''}</div>
      <p class="lead">${msg}.</p>
-     <div class="note">${tuned ? 'Фиолетовая линия — tuned lens: для каждого слоя обучено преобразование в базис последнего слоя, поэтому ей можно верить и в ранних слоях. Столбцы — обычный logit lens.' : 'В ранних слоях logit lens систематически занижает готовность ответа: их векторы ещё не в том базисе, который читает lm_head. Столбец «KL до итога» в таблице показывает, насколько промежуточное распределение далеко от настоящего. Точнее — tuned lens: обучите её через tuned_lens.py и передайте в --tuned-lens.'}</div>
+     <div class="note">${tuned ? 'Фиолетовая линия — tuned lens: для каждого слоя обучено преобразование в базис последнего слоя, поэтому ей можно верить и в ранних слоях. Столбцы — обычный logit lens.' : 'В ранних слоях logit lens систематически занижает готовность ответа: их векторы ещё не в том базисе, который читает lm_head. Столбец «KL до итога» в таблице показывает, насколько промежуточное распределение далеко от настоящего. Точнее — tuned lens: обучите её командой tuned-lens и передайте в --tuned-lens.'}</div>
      <svg viewBox="0 0 ${W} ${y3+20}" role="img" aria-label="Вероятность итогового токена по слоям">${g}</svg>
      <div class="legend"><span><i style="background:var(--blue)"></i>линейный слой</span><span><i style="background:var(--orange)"></i>полное внимание</span>${tuned?'<span><i style="background:var(--violet)"></i>tuned lens</span>':''}</div>
      <details><summary>таблица по слоям (топ-3 токена, вероятность и ранг итогового)</summary><div class="scroll"><table><tr><th class="num">слой</th><th>тип</th><th>топ-3 после слоя</th><th class="num">p итога</th><th class="num">ранг итога</th>${hasKl?'<th class="num">KL до итога</th>':''}${tuned?'<th>tuned lens: лучший</th><th class="num">ранг итога</th><th class="num">KL</th>':''}</tr>${trs}</table></div></details>` + lensGrid();
@@ -559,7 +562,7 @@ function renderAttn(){
 const pf = p => p>=0.001 ? f(p,4) : Number(p).toExponential(2);
 function entropyBlock(s){
   const d = s.detail;
-  if (!d) return '<div class="note">Для этого прогона нет пошагового расчёта энтропии — пересоберите его новой версией trace_qwen.py.</div>';
+  if (!d) return '<div class="note">Для этого прогона нет пошагового расчёта энтропии — пересоберите его новой версией layerscope.</div>';
   let cum = 0;
   const tm = Math.max(...d.top.map(t => t.term), 1e-12);
   const rows = d.top.map((t,i) => { cum += t.term; return `<tr class="${i===0?'hl':''}"><td class="num">${i+1}</td><td class="mono">${vis(t.token)}</td><td class="num">${t.logit}</td><td class="num">${f(t.logit-d.lse,3)}</td><td class="num">${pf(t.prob)}</td><td class="num">${f(t.term,5)}</td><td style="width:150px"><span class="bar" style="width:${t.term/tm*140}px;background:var(--orange)"></span></td><td class="num">${f(cum,5)}</td></tr>`; }).join('');
@@ -608,8 +611,8 @@ function renderSample(){
 
 // ───────────── Карта важности ─────────────
 function renderMap(){
-  if (!LM && LMX) { $('#s-map').innerHTML = hdr('', 'Карта важности слоёв', 'Показывает, какие слои модель не может потерять без последствий.') + empty('Построена только быстрая карта (--fast, без перебора слоёв) — она в следующем разделе. Для полной карты с доверительными интервалами запустите layer_map.py без --fast.'); return; }
-  if (!LM) { $('#s-map').innerHTML = hdr('', 'Карта важности слоёв', 'Показывает, какие слои модель не может потерять без последствий.') + empty('Карта не построена. Запустите trace_qwen.py с флагом --layer-map (или layer_map.py --run-dir этой папки) и пересоберите отчёт.'); return; }
+  if (!LM && LMX) { $('#s-map').innerHTML = hdr('', 'Карта важности слоёв', 'Показывает, какие слои модель не может потерять без последствий.') + empty('Построена только быстрая карта (--fast, без перебора слоёв) — она в следующем разделе. Для полной карты с доверительными интервалами запустите layer-map без --fast.'); return; }
+  if (!LM) { $('#s-map').innerHTML = hdr('', 'Карта важности слоёв', 'Показывает, какие слои модель не может потерять без последствий.') + empty('Карта не построена. Запустите trace с флагом --layer-map (или layer-map --run-dir этой папки) и пересоберите отчёт.'); return; }
   const rows = LM.layers, ci = S.metric==='kl' && rows[0].kl_hi!=null;
   const vm = Math.max(...rows.map(r => ci ? r.kl_hi : metricVal(r))) || 1;
   const W = 1100, padL = 60, padR = 8, cw = (W-padL-padR)/rows.length, y1 = 150, y0 = 16;
@@ -699,7 +702,7 @@ function renderDla(){
   const top = [...A.components].sort((a,b)=>Math.abs(dif(b))-Math.abs(dif(a))).slice(0,10), tm = Math.abs(dif(top[0])) || 1;
   const trs = top.map(c => `<tr><td>${c.layer==null ? nm[c.kind] : `слой ${c.layer} · ${nm[c.kind]}`}</td><td class="num">${sgn(dif(c))}</td><td style="width:240px"><span class="bar" style="width:${Math.abs(dif(c))/tm*220}px;background:var(${dif(c)>=0?'--blue':'--red'})"></span></td><td class="num">${sgn(lgt(c))}</td></tr>`).join('');
   const opt = sel => cands.map((c,j) => `<option value="${j}"${j===sel?' selected':''}>${vis(c.token)}  (${pct(c.prob)})</option>`).join('');
-  const pick = rich ? `<div class="legend">сравнить: <select data-dla="t">${opt(S.dt)}</select> над <select data-dla="r">${opt(S.dr)}</select> <span class="muted">любая пара из ${K} лучших кандидатов этого шага; первый в списке — выбранный токен</span></div>` : `<div class="note">В этом журнале вклады посчитаны только для пары «выбранный токен — соперник»; чтобы сравнивать любые пары, пересоберите прогон новой версией trace_qwen.py.</div>`;
+  const pick = rich ? `<div class="legend">сравнить: <select data-dla="t">${opt(S.dt)}</select> над <select data-dla="r">${opt(S.dr)}</select> <span class="muted">любая пара из ${K} лучших кандидатов этого шага; первый в списке — выбранный токен</span></div>` : `<div class="note">В этом журнале вклады посчитаны только для пары «выбранный токен — соперник»; чтобы сравнивать любые пары, пересоберите прогон новой версией layerscope.</div>`;
   const sumL = A.logits_sum ? A.logits_sum[S.dt] : A.logit_sum, actL = A.logits_actual ? A.logits_actual[S.dt] : A.logit_actual;
   sec.innerHTML = hdr('', 'Разложение логита: какие слои привели к ответу', `Раскладывается логит <b>последней позиции</b> шага — тот, по которому модель выбирает следующий токен: у других позиций логиты тоже есть, но для ответа не используются (их «ожидания» по слоям — в разделе Logit lens, сетка по всем позициям). Выход модели — сумма записей в «остаточный поток»: эмбеддинг плюс вклад внимания и MLP каждого слоя. Поэтому преимущество одного токена над другим раскладывается по слоям точно, без дополнительных прогонов. Столбец вверх — слой подталкивал к первому токену пары, вниз — ко второму.`) + stepPicker() + pick +
     `<div class="tiles"><div class="tile"><b class="mono">${vis(tgt.token)}</b><span>токен</span></div><div class="tile"><b class="mono">${vis(rvl.token)}</b><span>с чем сравниваем</span></div><div class="tile"><b>${sgn(total,2)}</b><span>разность логитов (сумма вкладов)</span></div><div class="tile"><b>${sgn(emb,2)}</b><span>из них эмбеддинг</span></div></div>
@@ -953,6 +956,23 @@ function renderAll(){
   $('#n-quant').style.display = D.quant ? '' : 'none'; }
 if (BATCH) initBatch();
 else { setData(JSON.parse(document.getElementById('data').textContent)); renderAll(); }
+
+// Режим снимка для документации: страница.html#shot=s-lens&step=1&prompt=2&aq=5&lg=next&dt=0&dr=2
+// показывает только раздел s-lens в светлой теме, без меню (см. docs/make_screenshots.py).
+(function shotMode(){
+  const q = new URLSearchParams(location.hash.slice(1)), id = q.get('shot');
+  if (!id) return;
+  document.documentElement.setAttribute('data-theme', 'light');
+  document.body.classList.add('shot');
+  if (BATCH) showPrompt(q.get('prompt') != null ? +q.get('prompt') : -1);
+  if (D) {
+    if (q.get('step') != null) S.lens = +q.get('step');
+    for (const [k, f] of [['aq','aq'],['dt','dt'],['dr','dr'],['layer','layer'],['hl','hl'],['sstep','sstep'],['tok','tok']]) if (q.get(k) != null) S[f] = +q.get(k);
+    for (const k of ['lg','metric']) if (q.get(k)) S[k] = q.get(k);
+    if (!(BATCH && q.get('prompt') == null)) renderAll();
+  }
+  document.querySelectorAll('main > section').forEach(s => s.classList.toggle('on', s.id === id));
+})();
 
 const tipEl = $('#tip');
 function showTip(el, x, y){

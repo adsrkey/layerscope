@@ -5,7 +5,7 @@
 import mlx.core as mx
 from helpers import model
 
-from qwen_trace import attribution as A
+from layerscope import attribution as A
 
 
 def test_angular_distance():

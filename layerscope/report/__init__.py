@@ -1,7 +1,7 @@
 """
 report — собирает report.html из папки прогона (команда trace).
 
-    python -m qwen_trace report trace_logs/20261115_184500
+    python -m layerscope report trace_logs/20261115_184500
 
 Читает events.jsonl и (если есть) layer_map.json, patching.json, quant_compare.json,
 пишет report.html рядом.

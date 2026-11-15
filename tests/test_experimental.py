@@ -5,8 +5,8 @@
 import mlx.core as mx
 from helpers import PROMPT, calm_model
 
-from qwen_trace import core
-from qwen_trace import experimental as X
+from layerscope import core
+from layerscope import experimental as X
 
 
 def test_gradient_attribution_ig_completeness_experimental():

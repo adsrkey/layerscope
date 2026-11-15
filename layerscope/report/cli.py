@@ -7,7 +7,7 @@ from .build import build_batch_report, build_report
 
 def main(argv=None):
     ap = argparse.ArgumentParser(
-        prog="qwen-trace report",
+        prog="layerscope report",
         description="Пересобрать report.html из папки прогона (trace_logs/<дата_время>) "
                     "или из папки пакета (с batch.json)")
     ap.add_argument("run_dir", help="папка прогона или пакета")

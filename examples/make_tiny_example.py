@@ -19,9 +19,9 @@ sys.path[:0] = [str(ROOT), str(ROOT / "tests")]
 
 from tiny import tiny_model  # noqa: E402
 
-from qwen_trace import layer_map as LM, patching, quant_compare, report, tuned_lens  # noqa: E402
-from qwen_trace.journal import Journal  # noqa: E402
-from qwen_trace.pipeline import run  # noqa: E402
+from layerscope import layer_map as LM, patching, quant_compare, report, tuned_lens  # noqa: E402
+from layerscope.journal import Journal  # noqa: E402
+from layerscope.pipeline import run  # noqa: E402
 
 
 def main():

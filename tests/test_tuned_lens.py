@@ -9,7 +9,7 @@ from pathlib import Path
 import mlx.core as mx
 from helpers import model, of, traced_run
 
-from qwen_trace import tuned_lens
+from layerscope import tuned_lens
 
 
 # ───────────── tuned lens ─────────────

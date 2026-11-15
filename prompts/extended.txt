@@ -1,6 +1,6 @@
 # Расширенный набор для карты важности слоёв и сравнения моделей: 120 коротких промптов
 # по 10 типам задач, на русском и английском. Строки с # и пустые пропускаются.
-#   python -m qwen_trace layer-map /путь/к/модели --prompts prompts/extended.txt
+#   python -m layerscope layer-map /путь/к/модели --prompts prompts/extended.txt
 
 # ── факты ──
 What is the capital of Japan? Answer in one word.

@@ -5,9 +5,9 @@
 import mlx.core as mx
 from helpers import PROMPT, model, of, traced_run
 
-from qwen_trace import report
-from qwen_trace.analysis import top_k
-from qwen_trace.tracer import attention_weights
+from layerscope import report
+from layerscope.analysis import top_k
+from layerscope.tracer import attention_weights
 
 
 # ───────────── события и этапы прогона ─────────────

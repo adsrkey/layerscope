@@ -11,10 +11,10 @@ from pathlib import Path
 from tiny import tiny_model
 from helpers import PROMPT, of
 
-from qwen_trace import layer_map as LM
-from qwen_trace import pipeline
-from qwen_trace import quant_compare
-from qwen_trace.journal import Journal
+from layerscope import layer_map as LM
+from layerscope import pipeline
+from layerscope import quant_compare
+from layerscope.journal import Journal
 
 
 # ───────────── квантизация ─────────────

@@ -1,9 +1,9 @@
 """
 quant-compare — где квантизация искажает модель: сравнение двух вариантов одной модели.
 
-    python -m qwen_trace quant-compare /путь/к/исходной /путь/к/4-битной
-    python -m qwen_trace quant-compare /путь/к/8-битной /путь/к/4-битной --prompts prompts/extended.txt
-    python -m qwen_trace quant-compare REF TEST --run-dir trace_logs/<папка>      # добавить в отчёт
+    python -m layerscope quant-compare /путь/к/исходной /путь/к/4-битной
+    python -m layerscope quant-compare /путь/к/8-битной /путь/к/4-битной --prompts prompts/extended.txt
+    python -m layerscope quant-compare REF TEST --run-dir trace_logs/<папка>      # добавить в отчёт
 
 Первая модель — эталон (исходная или менее сжатая), вторая — проверяемая.
 Модели загружаются по очереди, так что память нужна только на одну.
@@ -114,7 +114,7 @@ def render(res: dict) -> str:
 
 
 def main(argv=None):
-    ap = argparse.ArgumentParser(prog="qwen-trace quant-compare", description="Сравнение двух вариантов модели по слоям")
+    ap = argparse.ArgumentParser(prog="layerscope quant-compare", description="Сравнение двух вариантов модели по слоям")
     ap.add_argument("ref_path", help="эталон: исходная или менее сжатая модель")
     ap.add_argument("test_path", help="проверяемая (квантизованная) модель")
     ap.add_argument("--prompts", help="файл с промптами, один в строке")

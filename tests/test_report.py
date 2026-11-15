@@ -8,7 +8,7 @@ import subprocess
 
 from helpers import ROOT, make_batch, traced_run
 
-from qwen_trace import report
+from layerscope import report
 
 
 def test_report_old_single_token_attr_format():

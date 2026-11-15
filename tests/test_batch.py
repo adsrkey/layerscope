@@ -6,8 +6,8 @@ import json
 
 from helpers import make_batch, of, page_blocks
 
-from qwen_trace import report
-from qwen_trace.batch import prompt_slug
+from layerscope import report
+from layerscope.batch import prompt_slug
 
 
 # ───────────── пакетный режим ─────────────

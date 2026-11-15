@@ -11,9 +11,9 @@ patch — activation patching: где в модели хранится то, ч�
 подменяется выходом из чистого прогона. Если после этого модель снова отвечает «Париж»,
 значит, именно там проходит информация о стране.
 
-    python -m qwen_trace patch /путь/к/модели --clean "Столица Франции —" --corrupt "Столица Италии —"
-    python -m qwen_trace patch /путь/к/модели --clean "..." --corrupt "..." --component all
-    python -m qwen_trace patch /путь/к/модели --clean "..." --corrupt "..." --run-dir trace_logs/<папка>
+    python -m layerscope patch /путь/к/модели --clean "Столица Франции —" --corrupt "Столица Италии —"
+    python -m layerscope patch /путь/к/модели --clean "..." --corrupt "..." --component all
+    python -m layerscope patch /путь/к/модели --clean "..." --corrupt "..." --run-dir trace_logs/<папка>
 
 Оценка клетки: 0 — подмена ничего не изменила, 1 — полностью вернула чистый ответ.
 Промпты лучше подбирать одинаковой длины в токенах: позиции сопоставляются с конца.
@@ -145,7 +145,7 @@ def render(res: dict) -> str:
 
 
 def main(argv=None):
-    ap = argparse.ArgumentParser(prog="qwen-trace patch", description="Activation patching для Qwen (MLX)")
+    ap = argparse.ArgumentParser(prog="layerscope patch", description="Activation patching для Qwen (MLX)")
     ap.add_argument("model_path")
     ap.add_argument("--clean", required=True, help="промпт с правильным ответом")
     ap.add_argument("--corrupt", required=True, help="тот же промпт с изменённой деталью")

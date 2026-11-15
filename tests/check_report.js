@@ -21,8 +21,9 @@ const KNOWN = new Set(['psel', 'pprev', 'pnext', 'pswitch', 'theme', 'tip', 'sec
 const document = {
   getElementById: id => id in jsons ? {textContent: jsons[id]} : (KNOWN.has(id) || id.startsWith('s-') ? mk(id) : null),
   querySelector: s => mk(s.replace('#', '')), querySelectorAll: () => [],
-  addEventListener() {}, documentElement: mk('root')};
+  addEventListener() {}, documentElement: mk('root'), body: mk('body')};
 const matchMedia = () => ({matches: false});
+const location = {hash: process.env.HASH || ''};      // HASH='shot=s-lens&step=0' — режим снимка
 const innerWidth = 1200, innerHeight = 800;
 
 let failed = false;
@@ -38,7 +39,7 @@ const check = label => {
   if (bad.length) failed = true;
 };
 try {
-  new Function('document', 'matchMedia', 'innerWidth', 'innerHeight', code)(document, matchMedia, innerWidth, innerHeight);
+  new Function('document', 'matchMedia', 'innerWidth', 'innerHeight', 'location', code)(document, matchMedia, innerWidth, innerHeight, location);
   check('загрузка');
   const psel = els['psel'];
   if (jsons.batch) {

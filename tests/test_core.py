@@ -5,7 +5,7 @@
 import mlx.core as mx
 import mlx.nn as nn
 
-from qwen_trace import core
+from layerscope import core
 
 from helpers import PROMPT, model
 

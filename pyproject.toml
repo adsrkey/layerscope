@@ -3,9 +3,9 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "qwen-trace"
+name = "layerscope"
 version = "0.3.0"
-description = "Журнал и причинный анализ одного прогона Qwen3.5/3.8 в MLX: от промпта до ответа"
+description = "layerscope — разбор Qwen3.5/3.8 на MLX: от промпта к ответу и какие слои за него отвечают"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
@@ -17,13 +17,13 @@ dependencies = [
 dev = ["pytest>=8"]
 
 [project.scripts]
-qwen-trace = "qwen_trace.__main__:main"
+layerscope = "layerscope.__main__:main"
 
 [tool.setuptools.packages.find]
-include = ["qwen_trace*"]
+include = ["layerscope*"]
 
 [tool.setuptools.package-data]
-"qwen_trace.report" = ["template.html"]
+"layerscope.report" = ["template.html"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

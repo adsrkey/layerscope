@@ -7,11 +7,11 @@ tuned-lens — обучаемая линза (tuned lens, Belrose et al., 2023) 
 переводит вектор слоя в базис последнего слоя. Сама модель не меняется.
 
 Обучение (один раз на модель, минуты):
-    python -m qwen_trace tuned-lens /путь/к/модели --texts corpus.txt --out lens.safetensors
-    python -m qwen_trace tuned-lens /путь/к/модели                  # без корпуса: на встроенных промптах
+    python -m layerscope tuned-lens /путь/к/модели --texts corpus.txt --out lens.safetensors
+    python -m layerscope tuned-lens /путь/к/модели                  # без корпуса: на встроенных промптах
 
 Использование:
-    python -m qwen_trace trace /путь/к/модели "промпт" --tuned-lens lens.safetensors
+    python -m layerscope trace /путь/к/модели "промпт" --tuned-lens lens.safetensors
 
 Чем больше текста, тем лучше: встроенных промптов хватает только на грубую линзу,
 для аккуратной нужен файл хотя бы на несколько сотен тысяч токенов.
@@ -165,7 +165,7 @@ def train(model, chunks: list, rank: int = 64, steps: int = 300, lr: float = 1e-
 
 
 def main(argv=None):
-    ap = argparse.ArgumentParser(prog="qwen-trace tuned-lens", description="Обучение tuned lens для Qwen (MLX)")
+    ap = argparse.ArgumentParser(prog="layerscope tuned-lens", description="Обучение tuned lens для Qwen (MLX)")
     ap.add_argument("model_path")
     ap.add_argument("--texts", help="текстовый файл-корпус (чем больше, тем лучше)")
     ap.add_argument("--out", default="tuned_lens.safetensors")
@@ -191,7 +191,7 @@ def main(argv=None):
     lens = train(model, chunks, a.rank, a.steps, a.lr, a.positions, a.seed)
     lens.meta["model"] = model_fingerprint(a.model_path).get("fingerprint", "")
     lens.save(a.out)
-    print(f"\nЛинза сохранена: {a.out}\nИспользование: python -m qwen_trace trace {a.model_path} "
+    print(f"\nЛинза сохранена: {a.out}\nИспользование: python -m layerscope trace {a.model_path} "
           f"\"промпт\" --tuned-lens {a.out}")
 
 

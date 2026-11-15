@@ -1,4 +1,4 @@
-"""Точка входа: python -m qwen_trace <команда> ...  (или команда qwen-trace после pip install)."""
+"""Точка входа: python -m layerscope <команда> ...  (или команда layerscope после pip install)."""
 import importlib
 import sys
 
@@ -15,10 +15,10 @@ COMMANDS = {
 def usage() -> str:
     width = max(map(len, COMMANDS))
     rows = "\n".join(f"  {name:<{width}}  {text}" for name, (_, text) in COMMANDS.items())
-    return (f"использование: python -m qwen_trace <команда> [аргументы]\n\nкоманды:\n{rows}\n\n"
-            f"Справка по команде: python -m qwen_trace <команда> --help.\n"
+    return (f"использование: python -m layerscope <команда> [аргументы]\n\nкоманды:\n{rows}\n\n"
+            f"Справка по команде: python -m layerscope <команда> --help.\n"
             f"Если первый аргумент — не команда, выполняется trace "
-            f"(python -m qwen_trace МОДЕЛЬ \"промпт\").")
+            f"(python -m layerscope МОДЕЛЬ \"промпт\").")
 
 
 def main(argv=None):
@@ -30,7 +30,7 @@ def main(argv=None):
         module, args = COMMANDS[argv[0]][0], argv[1:]
     else:
         module, args = COMMANDS["trace"][0], argv
-    return importlib.import_module(f"qwen_trace.{module}").main(args)
+    return importlib.import_module(f"layerscope.{module}").main(args)
 
 
 if __name__ == "__main__":

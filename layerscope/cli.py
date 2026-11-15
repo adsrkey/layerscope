@@ -2,13 +2,13 @@
 trace — полный журнал одного прогона модели: от промпта до ответа.
 
 Запуск:
-    python -m qwen_trace trace /путь/к/папке/модели "Столица Франции — это"
-    python -m qwen_trace trace /путь/к/папке/модели "..." --max-tokens 30 --detail-steps 2
-    python -m qwen_trace trace /путь/к/папке/модели "..." --skip-layers 3,35,40-43
-    python -m qwen_trace trace /путь/к/папке/модели "..." --layer-map      # + карта важности слоёв
-    python -m qwen_trace trace /путь/к/папке/модели "..." --temperature 0.7 --top-p 0.9 --seed 1
-    python -m qwen_trace trace /путь/к/папке/модели "..." --tuned-lens tuned_lens.safetensors
-    python -m qwen_trace trace /путь/к/папке/модели --batch prompts/extended.txt --layer-map
+    python -m layerscope trace /путь/к/папке/модели "Столица Франции — это"
+    python -m layerscope trace /путь/к/папке/модели "..." --max-tokens 30 --detail-steps 2
+    python -m layerscope trace /путь/к/папке/модели "..." --skip-layers 3,35,40-43
+    python -m layerscope trace /путь/к/папке/модели "..." --layer-map      # + карта важности слоёв
+    python -m layerscope trace /путь/к/папке/модели "..." --temperature 0.7 --top-p 0.9 --seed 1
+    python -m layerscope trace /путь/к/папке/модели "..." --tuned-lens tuned_lens.safetensors
+    python -m layerscope trace /путь/к/папке/модели --batch prompts/extended.txt --layer-map
         # пакетный режим: разбор КАЖДОГО промпта в одном report.html с переключателем
 
 Результат — папка trace_logs/<дата_время>/ (в пакетном режиме — по подпапке на промпт,
@@ -53,7 +53,7 @@ def run_layer_map(model, tok, journal: Journal, a):
 
 
 def main(argv=None):
-    ap = argparse.ArgumentParser(prog="qwen-trace trace",
+    ap = argparse.ArgumentParser(prog="layerscope trace",
                                  description="Журнал прогона Qwen (MLX): промпт -> ответ")
     ap.add_argument("model_path")
     ap.add_argument("prompt", nargs="?", help="промпт (в пакетном режиме — необязателен)")

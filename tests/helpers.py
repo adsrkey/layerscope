@@ -8,8 +8,8 @@ from pathlib import Path
 
 from tiny import tiny_model
 
-from qwen_trace import batch, pipeline
-from qwen_trace.journal import Journal
+from layerscope import batch, pipeline
+from layerscope.journal import Journal
 
 ROOT = Path(__file__).resolve().parent.parent
 PROMPT = "What is 2+2?"

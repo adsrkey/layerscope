@@ -4,7 +4,7 @@
 """
 from helpers import model
 
-from qwen_trace import patching
+from layerscope import patching
 
 
 # ───────────── патчинг ─────────────

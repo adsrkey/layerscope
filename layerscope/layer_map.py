@@ -2,13 +2,13 @@
 layer-map — карта важности слоёв: что будет, если отключать слои по одному.
 
 Обычно запускается внутри команды trace:
-    python -m qwen_trace trace /путь/к/модели "промпт" --layer-map
+    python -m layerscope trace /путь/к/модели "промпт" --layer-map
 Тогда layer_map.json ложится в ту же папку, что trace.log, а в trace.log попадает таблица.
 
 Отдельно (карта для уже сделанного прогона — файл добавится в его папку):
-    python -m qwen_trace layer-map /путь/к/модели --run-dir trace_logs/20261115_184500
-    python -m qwen_trace layer-map /путь/к/модели --prompts prompts/extended.txt --tokens 12 --window 4
-    python -m qwen_trace layer-map /путь/к/модели --fast          # без перебора, только угловое расстояние
+    python -m layerscope layer-map /путь/к/модели --run-dir trace_logs/20261115_184500
+    python -m layerscope layer-map /путь/к/модели --prompts prompts/extended.txt --tokens 12 --window 4
+    python -m layerscope layer-map /путь/к/модели --fast          # без перебора, только угловое расстояние
 
 Два измерения:
 
@@ -275,7 +275,7 @@ def save_json(res: dict, path):
 
 
 def main(argv=None):
-    ap = argparse.ArgumentParser(prog="qwen-trace layer-map", description="Карта важности слоёв Qwen (MLX)")
+    ap = argparse.ArgumentParser(prog="layerscope layer-map", description="Карта важности слоёв Qwen (MLX)")
     ap.add_argument("model_path")
     ap.add_argument("--run-dir", help="папка прогона trace: карта добавится в неё "
                                       "(и report.html будет пересобран)")

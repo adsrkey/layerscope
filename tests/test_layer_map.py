@@ -4,8 +4,8 @@
 """
 from helpers import model, traced_run
 
-from qwen_trace import layer_map as LM
-from qwen_trace import report
+from layerscope import layer_map as LM
+from layerscope import report
 
 
 def test_layer_map_and_report():
