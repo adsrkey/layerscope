@@ -1,9 +1,8 @@
 # Расширенный набор для карты важности слоёв и сравнения моделей: 120 коротких промптов
 # по 10 типам задач, на русском и английском. Строки с # и пустые пропускаются.
-#   python layer_map.py /путь/к/модели --prompts prompts/extended.txt
+#   python -m qwen_trace layer-map /путь/к/модели --prompts prompts/extended.txt
 
 # ── факты ──
-Назови столицу Франции одним словом.
 What is the capital of Japan? Answer in one word.
 Кто написал роман «Война и мир»?
 Which planet is closest to the Sun? One word.
