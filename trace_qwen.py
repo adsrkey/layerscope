@@ -9,8 +9,11 @@ trace_qwen.py — полный журнал одного прогона моде
     python trace_qwen.py /путь/к/папке/модели "..." --layer-map      # + карта важности слоёв
     python trace_qwen.py /путь/к/папке/модели "..." --temperature 0.7 --top-p 0.9 --seed 1
     python trace_qwen.py /путь/к/папке/модели "..." --tuned-lens tuned_lens.safetensors
+    python trace_qwen.py /путь/к/папке/модели --batch prompts/extended.txt --layer-map
+        # пакетный режим: разбор КАЖДОГО промпта в одном report.html с переключателем
 
-Результат — папка trace_logs/<дата_время>/:
+Результат — папка trace_logs/<дата_время>/ (в пакетном режиме — по подпапке на промпт,
+плюс один report.html со сводкой и переключателем промптов и layer_map.json, общий для всех):
     trace.log       читаемый журнал всех этапов (с картой важности, если включена)
     events.jsonl    те же события построчно в JSON (первое событие — метаданные прогона)
     layer_map.json  карта важности слоёв (только с --layer-map)
@@ -24,7 +27,12 @@ trace_qwen.py — полный журнал одного прогона моде
 Рассчитан на Qwen3.5/3.8 в формате MLX (mlx-vlm, model_type "qwen3_5").
 """
 import argparse
+import contextlib
+import io
 import json
+import math
+import re
+import shutil
 import sys
 import time
 from datetime import datetime
@@ -250,30 +258,41 @@ class Tracer:
             self._sdpa = None
 
     def _log_attention(self, queries, keys, scale):
-        q = queries[0, :, -1, :].astype(mx.float32)        # (H, D)
+        """Внимание последних позиций запроса (до 48) ко всем токенам контекста.
+        Для подробного разбора по головам берётся только самая последняя позиция."""
+        nq = min(queries.shape[2], 48)
+        q = queries[0, :, -nq:, :].astype(mx.float32)      # (H, nq, D)
         k = keys[0].astype(mx.float32)                     # (Hkv, L, D)
         if k.shape[0] != q.shape[0]:
             k = mx.repeat(k, q.shape[0] // k.shape[0], axis=0)
-        w = mx.softmax((q[:, None, :] * k).sum(-1) * scale, axis=-1)   # (H, L)
-        avg = w.mean(axis=0)                               # среднее по головам
+        L = k.shape[1]
+        scores = (q @ k.transpose(0, 2, 1)) * scale        # (H, nq, L)
+        qpos = (L - nq) + mx.arange(nq)                    # абсолютные позиции запросов
+        causal = mx.arange(L)[None, :] <= qpos[:, None]    # токен видит себя и всё до себя
+        w_all = mx.softmax(mx.where(causal[None], scores, -mx.inf), axis=-1)   # (H, nq, L)
+        w = w_all[:, -1, :]                                # (H, L): последний токен, по головам
+        avg_all = w_all.mean(axis=0)                       # (nq, L): среднее по головам
+        avg = avg_all[-1]
         head_pos, head_w = mx.argmax(w, axis=-1), mx.max(w, axis=-1)
         ent = -(avg * mx.log(avg + 1e-12)).sum()
         head_ent = -(w * mx.log(w + 1e-12)).sum(axis=-1)
-        mx.eval(avg, head_pos, head_w, ent, head_ent, w)
+        mx.eval(avg, head_pos, head_w, ent, head_ent, w, avg_all)
         top = mx.argsort(-avg)[:8].tolist()
         avg_l = avg.tolist()
         layer = self.stack[-1] if self.stack else "?"
         tk = lambda p: self.tokens[p] if p < len(self.tokens) else "?"
         items = [{"pos": p, "token": tk(p), "weight": round(avg_l[p], 4)} for p in top]
-        rec = {"heads": q.shape[0], "context": k.shape[1], "top": items,
+        rec = {"heads": q.shape[0], "context": L, "top": items,
                "entropy": round(ent.item(), 4),
                "head_top": [[p, round(v, 4)] for p, v in
                             zip(head_pos.tolist(), head_w.tolist())],
                "head_entropy": [round(v, 3) for v in head_ent.tolist()]}
-        if k.shape[1] <= 512:
+        if L <= 512:
             rec["dist"] = [round(v, 4) for v in avg_l]
-        if k.shape[1] <= 160:                              # каждая голова отдельно: (H, L)
+        if L <= 160:                                       # каждая голова отдельно: (H, L)
             rec["heads_dist"] = [[round(v, 3) for v in row] for row in w.tolist()]
+            rec["matrix"] = [[round(v, 3) for v in row] for row in avg_all.tolist()]
+            rec["q_start"] = L - nq                        # позиция первой строки матрицы
         self.j.event("attention", step=self.step, module=layer, **rec)
         pretty = "  ".join(f"{it['token']!r}:{it['weight']}" for it in items)
         self.j.text(f"{'  ' * len(self.stack)}ВНИМАНИЕ последнего токена "
@@ -384,21 +403,45 @@ def embedding_report(lm, ids, tok, journal: Journal, k: int = 5, max_vec: int = 
                      f"первые значения {t['head'][:4]}  ближайшие: {nb}", echo=False)
 
 
-def top_k(logits_row: mx.array, tok, k: int = 5):
-    """Лучшие кандидаты (токен, логит, вероятность) и общие характеристики распределения."""
+def sig(x: float, n: int = 4) -> float:
+    """Число с n значащими цифрами (для малых вероятностей, которые иначе округлятся в 0)."""
+    return float(f"{x:.{n}g}")
+
+
+def top_k(logits_row: mx.array, tok, k: int = 5, detail_k: int = 20):
+    """Лучшие кандидаты (токен, логит, вероятность) и характеристики распределения.
+
+    Энтропия считается точно: p = exp(z − logsumexp(z)), вклад каждого токена −p·ln p.
+    В поле detail — пошаговый расчёт для отчёта: вклады топ-20 токенов и хвоста."""
     lf = logits_row.astype(mx.float32)
-    probs = mx.softmax(lf, axis=-1)
-    top = mx.argsort(-probs)[:k]
-    sp = mx.sort(probs)[::-1]
-    ent = -(probs * mx.log(probs + 1e-12)).sum()
+    lse = mx.logsumexp(lf)
+    logp = lf - lse
+    probs = mx.exp(logp)
+    term = -probs * logp                               # вклад токена в энтропию
+    order = mx.argsort(-probs)
+    top = order[:max(k, detail_k)]
+    sp = probs[order]
+    ent = term.sum()
     nuc = (mx.cumsum(sp) < 0.95).sum() + 1
-    mass20 = sp[:20].sum()
-    pv, lv = probs[top], lf[top]
-    mx.eval(top, pv, lv, ent, nuc, mass20)
+    mass_top = sp[:detail_k].sum()
+    pv, lv, tv = probs[top], lf[top], term[top]
+    mx.eval(top, pv, lv, tv, ent, nuc, mass_top, lse)
+    ids, pl, ll, tl = top.tolist(), pv.tolist(), lv.tolist(), tv.tolist()
     best = [{"id": i, "token": tok.decode([i]), "prob": round(p, 4), "logit": round(l, 3)}
-            for i, p, l in zip(top.tolist(), pv.tolist(), lv.tolist())]
-    return best, {"entropy": round(ent.item(), 4), "nucleus95": int(nuc.item()),
-                  "top20_mass": round(mass20.item(), 4)}
+            for i, p, l in zip(ids[:k], pl[:k], ll[:k])]
+    H, V = ent.item(), int(lf.shape[-1])
+    top_term = sum(tl[:detail_k])
+    detail = {"lse": round(lse.item(), 4), "vocab": V,
+              "top": [{"id": i, "token": tok.decode([i]), "logit": round(l, 3),
+                       "prob": sig(p), "term": sig(t)}
+                      for i, p, l, t in zip(ids[:detail_k], pl, ll, tl)],
+              "top_term": sig(top_term),
+              "tail": {"n": V - detail_k, "mass": sig(max(0.0, 1.0 - mass_top.item())),
+                       "term": sig(max(0.0, H - top_term))},
+              "bits": round(H / math.log(2), 4), "perplexity": round(math.exp(H), 3),
+              "max_entropy": round(math.log(V), 4)}
+    return best, {"entropy": round(H, 4), "nucleus95": int(nuc.item()),
+                  "top20_mass": round(mass_top.item(), 4), "detail": detail}
 
 
 def analyze_hidden(lm, hidden, emb_out, tok, final_id, final_logits, journal: Journal, step,
@@ -459,9 +502,13 @@ def analyze_hidden(lm, hidden, emb_out, tok, final_id, final_logits, journal: Jo
                   final_id=final_id, final_token=tok.decode([final_id]))
 
 
-def logit_attribution(lm, tracer: Tracer, emb_last, h_final, target: dict, other: dict,
-                      actual_logit: float, journal: Journal, step):
-    """Разложение логита выбранного токена на вклады эмбеддинга и каждого слоя."""
+def logit_attribution(lm, tracer: Tracer, emb_last, h_final, cands: list, final_logits,
+                      journal: Journal, step):
+    """Разложение логитов кандидатов на вклады эмбеддинга и каждого слоя.
+
+    Раскладывается логит последней позиции шага — тот, по которому выбирается токен.
+    cands[0] — выбранный токен, cands[1] — главный соперник; остальные нужны, чтобы в отчёте
+    можно было сравнить любую пару."""
     skipped = {layer_of(n) for n in tracer.skip}
     parts, meta = [("emb", emb_last)], [{"layer": None, "kind": "emb"}]
     for i in range(len(lm.model.layers)):
@@ -473,19 +520,59 @@ def logit_attribution(lm, tracer: Tracer, emb_last, h_final, target: dict, other
                 meta.append({"layer": i, "kind": kind})
     if len(parts) < 2:
         return
-    lt, diff, total, gap = direct_logit_attribution(lm, parts, h_final, target["id"], other["id"])
-    comps = [{**m, "logit": round(a, 4), "diff": round(d, 4)} for m, a, d in zip(meta, lt, diff)]
-    journal.event("dla", step=step, target=target, other=other, components=comps,
-                  logit_sum=round(total, 4), logit_actual=round(actual_logit, 4),
-                  residual_gap=round(gap, 5))
+    ids = [c["id"] for c in cands]
+    rows, totals, gap = direct_logit_attribution(lm, parts, h_final, ids)
+    actual = final_logits[mx.array(ids)].astype(mx.float32).tolist()
+    comps = [{**m, "logit": round(r[0], 4), "diff": round(r[0] - r[1], 4),
+              "logits": [round(v, 3) for v in r]} for m, r in zip(meta, rows)]
+    target, other = cands[0], cands[1]
+    journal.event("dla", step=step, target=target, other=other, cands=cands, components=comps,
+                  logit_sum=round(totals[0], 4), logit_actual=round(actual[0], 4),
+                  logits_sum=[round(v, 4) for v in totals],
+                  logits_actual=[round(v, 4) for v in actual], residual_gap=round(gap, 5))
     journal.text(f"\n--- Разложение логита, шаг {step}: что подняло {target['token']!r} "
                  f"над {other['token']!r} ---")
-    journal.text(f"сумма вкладов {total:.3f}, настоящий логит {actual_logit:.3f} "
-                 f"(расхождение — точность половинных чисел; невязка потока {gap:.2%})")
+    journal.text(f"сумма вкладов {totals[0]:.3f}, настоящий логит {actual[0]:.3f} "
+                 f"(расхождение — точность половинных чисел; невязка потока {gap:.2%}); "
+                 f"те же вклады посчитаны ещё для {len(cands) - 2} кандидатов — в отчёте можно "
+                 f"выбрать любую пару")
     name = {"emb": "эмбеддинг", "attn": "внимание", "mlp": "MLP"}
     for c in sorted(comps, key=lambda c: -abs(c["diff"]))[:10]:
         where = name[c["kind"]] if c["layer"] is None else f"слой {c['layer']:2d} {name[c['kind']]}"
         journal.text(f"  {where:<18} вклад в разность {c['diff']:+8.3f}   в логит {c['logit']:+8.3f}")
+
+
+def lens_grid(lm, hidden, ids, tok, journal: Journal, step, lens=None, max_pos: int = 64):
+    """Logit lens на КАЖДОЙ позиции промпта (а не только на последней): что модель
+    ожидала бы дальше после каждого токена на каждом слое. Для токенов промпта
+    следующий токен известен, поэтому записывается и ранг настоящего продолжения."""
+    L = len(ids)
+    pos0 = L - min(L, max_pos)
+    tgt = mx.array([ids[i + 1] if i + 1 < L else 0 for i in range(pos0, L)])
+    tops, probs, ranks = [], [], []
+    for i, h in enumerate(hidden):
+        x = h[0, pos0:, :]
+        if lens is not None and i < lens.n_layers:
+            x = lens(i, x)
+        lp = log_softmax(lens_logits(lm, x[None])[0])                     # (P, V)
+        best = mx.max(lp, axis=-1)
+        rank = (lp > mx.take_along_axis(lp, tgt[:, None], axis=-1)).sum(axis=-1) + 1
+        top = mx.argmax(lp, axis=-1)
+        pr = mx.exp(best)
+        mx.eval(top, pr, rank)
+        tops.append(top.tolist())
+        probs.append([round(v, 3) for v in pr.tolist()])
+        ranks.append(rank.tolist())
+    vocab = {str(t): tok.decode([t]) for row in tops for t in row}
+    journal.event("lens_grid", step=step, tuned=lens is not None, positions=list(range(pos0, L)),
+                  top=tops, p=probs, rank=ranks, vocab=vocab)
+    journal.text("\n--- Logit lens по всем позициям промпта: ожидание следующего токена "
+                 "на последнем слое ---", echo=False)
+    for j, pos in enumerate(range(pos0, L)):
+        nxt = tok.decode([ids[pos + 1]]) if pos + 1 < L else "(ответ)"
+        journal.text(f"  поз {pos:3d} {tok.decode([ids[pos]])!r:>16} -> {vocab[str(tops[-1][j])]!r:<14} "
+                     f"p={probs[-1][j]:<6} | настоящий следующий {nxt!r}, ранг {ranks[-1][j]}",
+                     echo=False)
 
 
 def prompt_attribution(lm, ctx_ids, tok, target: dict, other: dict, journal: Journal,
@@ -600,8 +687,11 @@ def generate(model, tok, ids, tracer: Tracer, journal: Journal, max_tokens: int,
         if detailed and hidden:
             emb_out = lm.model.embed_tokens(inputs)
             analyze_hidden(lm, hidden[:n_layers], emb_out, tok, nxt, logits, journal, step, lens)
+            if step == 0 and hidden[0].shape[1] == len(ids):
+                lens_grid(lm, hidden[:n_layers], ids, tok, journal, step, lens)
+            cands = [chosen] + [b for b in best if b["id"] != chosen["id"]][:4]
             logit_attribution(lm, tracer, emb_out[0, -1], hidden[n_layers - 1][0, -1],
-                              chosen, other, logits[nxt].item(), journal, step)
+                              cands, logits, journal, step)
 
         # 4. Логиты -> вероятности -> выбор токена
         if step == 0 or detailed:
@@ -609,6 +699,14 @@ def generate(model, tok, ids, tracer: Tracer, journal: Journal, max_tokens: int,
         journal.text(f"шаг {step:3d} ({ms} мс)  выбран {chosen['token']!r}   кандидаты: " +
                      "  ".join(f"{b['token']!r} {b['prob']}" for b in best) +
                      f"   [энтропия {extra['entropy']}, токенов в nucleus(0.95): {extra['nucleus95']}]")
+        if detailed:                              # пошаговый расчёт энтропии — в журнал
+            d = extra["detail"]
+            journal.text(f"   энтропия H = −Σ p·ln p = {d['top_term']} (топ-{len(d['top'])}) + "
+                         f"{d['tail']['term']} (ещё {d['tail']['n']} токенов, масса "
+                         f"{d['tail']['mass']}) = {extra['entropy']} нат = {d['bits']} бит; "
+                         f"exp(H) = {d['perplexity']} (как выбор из стольких равных вариантов); "
+                         f"максимум ln V = {d['max_entropy']}; ln Σ exp(z) = {d['lse']}",
+                         echo=False)
         journal.event("sample", run=label.strip(" :") or "основной", step=step, ms=ms,
                       traced=detailed, chosen=chosen, candidates=best, **extra)
         if detailed and token_attr:
@@ -755,6 +853,61 @@ def run(model, tok, prompt: str, journal: Journal, max_tokens: int = 20,
     return result["text"]
 
 
+def prompt_slug(prompt: str, n: int = 36) -> str:
+    """Короткое имя папки из текста промпта."""
+    s = re.sub(r"[\W_]+", "-", prompt, flags=re.UNICODE).strip("-").lower()
+    return s[:n].strip("-") or "prompt"
+
+
+def run_batch(model, tok, prompts: list, out_dir: Path, run_kwargs: dict, model_path=None,
+              map_cfg: dict = None, build_reports: bool = True, log=print) -> Path:
+    """Подробный прогон на каждый промпт — журнал каждого в своей подпапке, а отчёт один:
+    report.html в папке пакета, где вверху можно переключаться между промптами и «Сводкой».
+
+    Порядок: сначала считаются все прогоны, затем (если нужна) карта важности слоёв по тем
+    же промптам, потом пишется batch.json и собирается отчёт."""
+    out_dir.mkdir(parents=True, exist_ok=True)
+    entries, t0 = [], time.perf_counter()
+    for i, prompt in enumerate(prompts, 1):
+        entry = {"prompt": prompt, "dir": f"{i:02d}_{prompt_slug(prompt)}", "status": "ok"}
+        journal = Journal(out_dir / entry["dir"])
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):    # журнал каждого прогона — в его папку
+                entry["answer"] = run(model, tok, prompt, journal, model_path=model_path,
+                                      **run_kwargs)
+        except Exception as e:                                 # один сбой не должен губить пакет
+            entry.update(status="error", error=f"{type(e).__name__}: {e}")
+        finally:
+            journal.close()
+        el = time.perf_counter() - t0
+        log(f"[{i}/{len(prompts)}] {entry['status']:5s} {prompt[:60]!r}"
+            + (f" -> {entry['answer'][:40]!r}" if entry["status"] == "ok" else f"  {entry['error']}")
+            + f"   (прошло {el:.0f} с, осталось ~{el / i * (len(prompts) - i):.0f} с)")
+        entries.append(entry)
+    ok = [e for e in entries if e["status"] == "ok"]
+
+    if map_cfg and ok:
+        import layer_map as LM
+        log("\nКарта важности слоёв по тем же промптам:")
+        res = LM.build_map(model, tok, [e["prompt"] for e in ok], map_cfg["tokens"],
+                           map_cfg["window"], run_kwargs.get("thinking", False),
+                           run_kwargs.get("raw", False), log=log, fast=map_cfg["fast"])
+        LM.save_json(res, out_dir / "layer_map.json")
+        (out_dir / "layer_map.txt").write_text(LM.render(res), encoding="utf-8")
+        for e in ok:                       # копия нужна, чтобы подпапку можно было собрать отдельно
+            shutil.copy(out_dir / "layer_map.json", out_dir / e["dir"] / "layer_map.json")
+
+    (out_dir / "batch.json").write_text(json.dumps(
+        {"created": datetime.now().isoformat(timespec="seconds"), "prompts": entries},
+        ensure_ascii=False, indent=1), encoding="utf-8")
+    if build_reports:
+        import make_report
+        log(f"\nОтчёт: {make_report.build_batch_report(out_dir)}")
+    bad = len(entries) - len(ok)
+    log(f"готово: {len(ok)} из {len(entries)} промптов" + (f", с ошибками: {bad}" if bad else ""))
+    return out_dir
+
+
 def run_layer_map(model, tok, journal: Journal, a):
     """Карта важности слоёв в той же папке: таблица в trace.log, данные в layer_map.json."""
     import layer_map as LM
@@ -773,9 +926,14 @@ def run_layer_map(model, tok, journal: Journal, a):
 def main():
     ap = argparse.ArgumentParser(description="Журнал прогона Qwen (MLX): промпт -> ответ")
     ap.add_argument("model_path")
-    ap.add_argument("prompt")
+    ap.add_argument("prompt", nargs="?", help="промпт (в пакетном режиме — необязателен)")
+    ap.add_argument("--batch", nargs="?", const="", metavar="ФАЙЛ",
+                    help="пакетный режим: подробный разбор каждого промпта из файла (по одному "
+                         "в строке; без файла — 24 встроенных) в одном report.html с "
+                         "переключателем промптов. Промпт из командной строки добавляется первым")
+    ap.add_argument("--max-prompts", type=int, help="в пакетном режиме взять только первые N промптов")
     ap.add_argument("--max-tokens", type=int, default=20)
-    ap.add_argument("--detail-steps", type=int, default=1,
+    ap.add_argument("--detail-steps", type=int, default=3,
                     help="для скольких первых шагов писать каждый вызов модуля")
     ap.add_argument("--skip-layers", default="",
                     help="отключить слои, нумерация с нуля: 35  или  3,35,40-43")
@@ -796,7 +954,8 @@ def main():
     ap.add_argument("--tuned-lens", help="файл линзы из tuned_lens.py: точнее обычного logit lens")
     ap.add_argument("--layer-map", action="store_true",
                     help="после прогона построить карту важности слоёв (несколько минут)")
-    ap.add_argument("--map-prompts", help="файл с промптами для карты (по одному в строке)")
+    ap.add_argument("--map-prompts", help="файл с промптами для карты (по одному в строке); "
+                                              "в пакетном режиме карта строится по промптам пакета")
     ap.add_argument("--map-tokens", type=int, default=8, help="сколько токенов ответа сравнивать")
     ap.add_argument("--map-window", type=int, default=1, help="сколько слоёв отключать за раз")
     ap.add_argument("--map-fast", action="store_true",
@@ -805,6 +964,8 @@ def main():
     ap.add_argument("--out", default="trace_logs")
     a = ap.parse_args()
 
+    if not a.prompt and a.batch is None:
+        ap.error("укажите промпт или --batch")
     model, tok = load_model(a.model_path)
     skip = parse_layers(a.skip_layers, len(model.language_model.model.layers))
     lens = None
@@ -812,11 +973,27 @@ def main():
         from tuned_lens import TunedLens
         lens = TunedLens.load(a.tuned_lens)
 
-    journal = Journal(Path(a.out) / datetime.now().strftime("%Y%m%d_%H%M%S"))
+    root = Path(a.out) / datetime.now().strftime("%Y%m%d_%H%M%S")
+    run_kwargs = dict(max_tokens=a.max_tokens, detail_steps=a.detail_steps, thinking=a.thinking,
+                      raw=a.raw, skip_layers=skip, wstats=a.weight_stats,
+                      temperature=a.temperature, top_p=a.top_p, seed=a.seed,
+                      token_attr=not a.no_token_attr, ig_steps=a.ig_steps, lens=lens)
+
+    if a.batch is not None:
+        import layer_map as LM
+        prompts = LM.load_prompts(a.batch or None, first=a.prompt)
+        if a.max_prompts:
+            prompts = prompts[:a.max_prompts]
+        map_cfg = ({"tokens": a.map_tokens, "window": a.map_window, "fast": a.map_fast}
+                   if a.layer_map or a.map_fast else None)
+        print(f"пакетный режим: {len(prompts)} промптов -> {root}")
+        run_batch(model, tok, prompts, root, run_kwargs, a.model_path, map_cfg,
+                  build_reports=not a.no_report)
+        return
+
+    journal = Journal(root)
     try:
-        run(model, tok, a.prompt, journal, a.max_tokens, a.detail_steps, a.thinking,
-            a.raw, skip, a.weight_stats, a.temperature, a.top_p, a.seed,
-            not a.no_token_attr, a.ig_steps, lens, a.model_path)
+        run(model, tok, a.prompt, journal, model_path=a.model_path, **run_kwargs)
         if a.layer_map or a.map_fast:
             run_layer_map(model, tok, journal, a)
         journal.text(f"\nЖурнал: {journal.dir}/trace.log  и  {journal.dir}/events.jsonl "

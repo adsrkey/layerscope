@@ -5,6 +5,9 @@
 import contextlib
 import io
 import json
+import re
+import shutil
+import subprocess
 import sys
 import tempfile
 from pathlib import Path
@@ -180,6 +183,74 @@ def test_dla_is_exact():
         assert e["residual_gap"] < 1e-3
 
 
+def test_dla_any_pair_of_candidates():
+    """Вклады посчитаны для пяти кандидатов: сумма по компонентам равна настоящему логиту
+    каждого из них, а разность любой пары получается вычитанием."""
+    _, ev = traced_run(max_tokens=3, detail_steps=1)
+    e = of(ev, "dla")[0]
+    assert len(e["cands"]) == 5 and e["cands"][0]["id"] == e["target"]["id"]
+    assert e["cands"][1]["id"] == e["other"]["id"]
+    for j in range(5):
+        assert abs(e["logits_sum"][j] - e["logits_actual"][j]) < 1e-2
+        assert abs(sum(c["logits"][j] for c in e["components"]) - e["logits_sum"][j]) < 1e-2
+    assert all(abs(c["diff"] - (c["logits"][0] - c["logits"][1])) < 2e-3 for c in e["components"])
+
+
+def test_entropy_detail_adds_up():
+    """Пошаговый расчёт энтропии сходится: топ-20 плюс хвост равны полной энтропии."""
+    m, tok = model()
+    lm = m.language_model
+    x = mx.array([tok.encode(PROMPT)])
+    logits = lm(x).logits[0, -1]
+    best, extra = T.top_k(logits, tok)
+    d = extra["detail"]
+    p = mx.softmax(logits.astype(mx.float32))
+    H = -(p * mx.log(p)).sum().item()
+    assert abs(extra["entropy"] - H) < 1e-3
+    assert abs(d["top_term"] + d["tail"]["term"] - extra["entropy"]) < 2e-3
+    assert len(d["top"]) == 20 and d["tail"]["n"] == d["vocab"] - 20
+    assert abs(sum(t["prob"] for t in d["top"]) + d["tail"]["mass"] - 1) < 2e-3
+    assert abs(d["perplexity"] - mx.exp(mx.array(H)).item()) < 0.05
+    assert abs(d["bits"] * 0.6931471805599453 - H) < 1e-3 and d["max_entropy"] > H
+    for t in d["top"][:3]:                                   # ln p = z − ln Σ exp(z)
+        assert abs(t["logit"] - d["lse"] - mx.log(mx.array(t["prob"])).item()) < 2e-3
+    assert abs(d["lse"] - mx.logsumexp(logits.astype(mx.float32)).item()) < 1e-3
+    _, ev = traced_run(max_tokens=3, detail_steps=1)
+    assert all("detail" in e for e in of(ev, "sample"))
+
+
+def test_attention_matrix_every_query_position():
+    """Внимание записано для каждой позиции запроса: строки нормированы, будущее не видно,
+    последняя строка совпадает с вниманием последнего токена."""
+    _, ev = traced_run(max_tokens=2, detail_steps=1)
+    for a in of(ev, "attention"):
+        mat, q0 = a["matrix"], a["q_start"]
+        assert len(mat) == len(mat[0]) - q0
+        for i, row in enumerate(mat):
+            assert abs(sum(row) - 1) < 0.02
+            assert all(v == 0 for v in row[q0 + i + 1:])
+        assert max(abs(x - y) for x, y in zip(mat[-1], a["dist"])) < 2e-3
+
+
+def test_lens_grid_all_prompt_positions():
+    """Logit lens на каждой позиции промпта; на последнем слое — настоящие предсказания."""
+    m, tok = model()
+    lm = m.language_model
+    d, ev = traced_run(max_tokens=2, detail_steps=1)
+    g = of(ev, "lens_grid")[0]
+    ids = of(ev, "tokens")[0]["ids"]
+    assert g["positions"] == list(range(len(ids)))
+    assert len(g["top"]) == 8 and all(len(r) == len(ids) for r in g["top"])
+    real = mx.argmax(lm(mx.array([ids])).logits[0], axis=-1).tolist()
+    assert g["top"][-1] == real                                  # последний слой = настоящий выход
+    assert all(g["rank"][-1][i] >= 1 for i in range(len(ids) - 1))
+    # ранг настоящего продолжения совпадает с прямым подсчётом
+    lg = lm(mx.array([ids])).logits[0, 3].astype(mx.float32)
+    assert g["rank"][-1][3] == int((lg > lg[ids[4]]).sum().item()) + 1
+    assert set(map(str, {t for r in g["top"] for t in r})) <= set(g["vocab"])
+    assert make_report.build_data(d)["lens_grid"]["positions"] == g["positions"]
+
+
 def test_dla_with_skipped_layer():
     _, ev = traced_run(max_tokens=3, detail_steps=1, skip_layers=[2])
     e = of(ev, "dla")[0]
@@ -245,6 +316,88 @@ def test_tracer_cleans_up():
     traced_run(max_tokens=2, detail_steps=1)
     assert lang.scaled_dot_product_attention is before
     assert "wrapped" not in type(m.language_model).__call__.__qualname__
+
+
+# ───────────── пакетный режим ─────────────
+def test_prompt_slug():
+    assert T.prompt_slug("Назови столицу Франции одним словом.") == "назови-столицу-франции-одним-словом"
+    assert "/" not in T.prompt_slug("a/b: c?") and T.prompt_slug("???") == "prompt"
+    assert len(T.prompt_slug("x" * 200)) <= 36
+
+
+def make_batch():
+    """Пакет из трёх промптов (средний падает) с картой слоёв; собирается один раз."""
+    if "batch" in _cache:
+        return _cache["batch"]
+    m, tok = model()
+    out = Path(tempfile.mkdtemp()) / "batch"
+    prompts = ["What is 2+2?", "boom", "Name a color."]
+    kw = dict(max_tokens=4, detail_steps=2, thinking=False, raw=False, skip_layers=[],
+              wstats=False, temperature=0.0, top_p=1.0, seed=0, token_attr=True, ig_steps=0,
+              lens=None)
+    orig = T.run
+
+    def flaky(model, tok, prompt, *a, **k):
+        if prompt == "boom":
+            raise RuntimeError("boom")
+        return orig(model, tok, prompt, *a, **k)
+
+    T.run = flaky
+    try:
+        T.run_batch(m, tok, prompts, out, kw, map_cfg={"tokens": 3, "window": 1, "fast": False},
+                    log=lambda *a: None)
+    finally:
+        T.run = orig
+    _cache["batch"] = out
+    return out
+
+
+def page_blocks(html: str) -> dict:
+    return {k: json.loads(v.replace("<\\/", "</")) for k, v in
+            re.findall(r'<script id="([\w-]+)" type="application/json">(.*?)</script>', html, re.S)}
+
+
+def test_batch_mode_one_report_with_prompt_switcher():
+    """Один report.html на весь пакет; сбой одного промпта не губит остальных."""
+    out = make_batch()
+    b = json.loads((out / "batch.json").read_text(encoding="utf-8"))
+    assert [e["status"] for e in b["prompts"]] == ["ok", "error", "ok"]
+    assert "boom" in b["prompts"][1]["error"]
+    good = [e for e in b["prompts"] if e["status"] == "ok"]
+    for e in good:                                   # журнал каждого промпта — в своей подпапке
+        d = out / e["dir"]
+        assert all((d / n).exists() for n in ("events.jsonl", "trace.log", "layer_map.json"))
+        assert of([json.loads(l) for l in open(d / "events.jsonl", encoding="utf-8")], "dla")
+        assert not (d / "report.html").exists()      # отдельных отчётов на промпт нет
+    html = (out / "report.html").read_text(encoding="utf-8")
+    assert not (out / "index.html").exists()
+    blocks = page_blocks(html)
+    assert set(blocks) == {"batch", "d-0", "d-2"}    # у упавшего промпта данных нет
+    batch = blocks["batch"]
+    assert [e["status"] for e in batch["entries"]] == ["ok", "error", "ok"]
+    assert batch["layer_map"] and blocks["d-0"]["layer_map"] is None   # карта — одна на всех
+    assert blocks["d-0"]["prompt"]["prompt"] == "What is 2+2?"
+    assert blocks["d-2"]["prompt"]["prompt"] == "Name a color."
+    ok = [e for e in batch["entries"] if e["status"] == "ok"]
+    assert all("first" in e and len(e["dla_abs"]["attn"]) == 8 for e in ok)
+    # «особенно важный слой» показывается только при заметном превышении среднего
+    assert all("map_top" not in e or e["map_top"]["ratio"] >= 1.5 for e in ok)
+    assert make_report.build_batch_report(out).exists()      # пересборка из папки, без модели
+
+
+def test_report_scripts_run_in_node():
+    """Скрипт страницы выполняется: сводка и каждый промпт строятся без ошибок и NaN.
+    Нужен node; без него тест ничего не проверяет."""
+    node = shutil.which("node")
+    if not node:
+        print("node не найден — проверка скрипта страницы пропущена")
+        return
+    d, _ = traced_run(max_tokens=3, detail_steps=2)
+    single = make_report.build_report(d)
+    for path in (single, make_batch() / "report.html"):
+        r = subprocess.run([node, str(ROOT / "tests" / "check_report.js"), str(path)],
+                           capture_output=True, text=True)
+        assert r.returncode == 0, r.stdout + r.stderr
 
 
 # ───────────── карта слоёв ─────────────

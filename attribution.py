@@ -2,7 +2,7 @@
 """
 attribution.py — причинные и градиентные методы поверх qcore.Hooks.
 
-    direct_logit_attribution   вклад каждого слоя (внимание и MLP отдельно) в итоговый логит
+    direct_logit_attribution   вклад каждого слоя (внимание и MLP отдельно) в логиты любых токенов
     token_attribution          вклад каждого токена промпта (gradient × input или
                                integrated gradients) — работает и для линейных слоёв
     atp                        attribution patching: оценка важности всех слоёв за один
@@ -20,27 +20,31 @@ F32 = mx.float32
 
 
 # ───────────────── разложение логита по компонентам ─────────────────
-def direct_logit_attribution(lm, parts: list, h_final: mx.array, target: int, other: int):
-    """Точное разложение логита на вклады компонент.
+def direct_logit_attribution(lm, parts: list, h_final: mx.array, cand_ids: list):
+    """Точное разложение логитов нескольких токенов на вклады компонент.
 
     Выход модели — сумма записей в остаточный поток: эмбеддинг + выход внимания и MLP
     каждого слоя. Финальная норма (RMSNorm) делит эту сумму на её же длину, поэтому при
     «замороженной» длине логит линеен по слагаемым:  logit = Σ W_U · (вклад / rms · вес).
+    Раскладывается логит ТОЛЬКО последней позиции: именно по нему выбирается следующий
+    токен. Токены берутся любые (обычно — пять лучших кандидатов), так что вклады
+    разности логитов любой пары получаются вычитанием столбцов.
 
-    parts    [(метка, вектор последней позиции)], в порядке вычисления
-    h_final  вектор последней позиции после последнего слоя (до финальной нормы)
-    Возвращает (вклады в логит target, вклады в разность target − other, сумма, невязка)."""
+    parts     [(метка, вектор последней позиции)], в порядке вычисления
+    h_final   вектор последней позиции после последнего слоя (до финальной нормы)
+    cand_ids  id токенов, чьи логиты раскладываются
+    Возвращает (матрица вкладов (компонент × токенов), суммы по столбцам, невязка потока)."""
     C = mx.stack([v.astype(F32).reshape(-1) for _, v in parts])            # (n, D)
     hf = h_final.astype(F32).reshape(-1)
     norm = lm.model.norm
     rms = mx.sqrt((hf * hf).mean() + norm.eps)
     scaled = C / rms * norm.weight.astype(F32)
     logits = unembed(lm)(scaled).astype(F32)                               # (n, V)
-    lt, lo = logits[:, target], logits[:, other]
+    sel = logits[:, mx.array(cand_ids)]                                    # (n, K)
+    totals = sel.sum(axis=0)
     gap = mx.linalg.norm(C.sum(axis=0) - hf) / (mx.linalg.norm(hf) + 1e-9)
-    mx.eval(lt, lo, gap)
-    lt, lo = lt.tolist(), lo.tolist()
-    return lt, [a - b for a, b in zip(lt, lo)], sum(lt), gap.item()
+    mx.eval(sel, totals, gap)
+    return sel.tolist(), totals.tolist(), gap.item()
 
 
 # ───────────────── вклад токенов промпта ─────────────────

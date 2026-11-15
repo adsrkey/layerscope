@@ -6,6 +6,9 @@ make_report.py — собирает report.html из папки прогона t
 
 Читает events.jsonl и (если есть) layer_map.json, patching.json, quant_compare.json,
 пишет report.html рядом.
+
+Для папки пакета (trace_qwen.py --batch) собирает ОДИН report.html на все промпты:
+вверху переключатель между промптами и «Сводкой».
 Файл самодостаточный: данные и код внутри, сеть не нужна, открывается двойным щелчком.
 Модель для этого не нужна: отчёт можно пересобрать в любой момент.
 """
@@ -44,7 +47,7 @@ def build_data(run_dir) -> dict:
         elif e["kind"] == "attention":
             attn.setdefault(str(e["step"]), []).append(
                 {k: e[k] for k in ("module", "heads", "context", "top", "entropy", "head_top", "dist",
-                                   "heads_dist", "head_entropy")
+                                   "heads_dist", "head_entropy", "matrix", "q_start")
                  if k in e})
         elif e["kind"] == "residual":
             resid[str(e["step"])] = {k: e[k] for k in ("norms", "rel", "cos", "emb_norms",
@@ -55,13 +58,15 @@ def build_data(run_dir) -> dict:
     # вклад токенов контекста по шагам (в старых журналах он был один, без номера шага)
     D["token_attrs"] = {str(e.get("step", 0)): {k: v for k, v in e.items() if k not in ("n", "kind")}
                         for e in ev if e["kind"] == "token_attr"}
-    D["dla"] = {str(e["step"]): {k: e[k] for k in ("target", "other", "components", "logit_sum",
-                                                   "logit_actual", "residual_gap")}
+    D["lens_grid"] = first("lens_grid")
+    D["dla"] = {str(e["step"]): {k: e[k] for k in ("target", "other", "cands", "components",
+                                                   "logit_sum", "logit_actual", "logits_sum",
+                                                   "logits_actual", "residual_gap") if k in e}
                 for e in ev if e["kind"] == "dla"}
 
     samples = [e for e in ev if e["kind"] == "sample"]
     D["samples"] = [{k: s[k] for k in ("step", "ms", "chosen", "candidates", "entropy",
-                                       "nucleus95", "top20_mass", "traced") if k in s}
+                                       "nucleus95", "top20_mass", "traced", "detail") if k in s}
                     for s in samples if s.get("run") != "Обычный прогон"]
     D["skipped"] = sorted({int(e["module"].rsplit(".", 1)[-1]) for e in ev
                            if e["kind"] == "layer_skipped"})
@@ -123,7 +128,11 @@ nav{position:sticky;top:0;z-index:20;background:color-mix(in srgb,var(--bg) 88%,
   border-bottom:1px solid var(--line);display:flex;gap:4px;padding:8px 16px;overflow-x:auto;align-items:center}
 nav a{color:var(--ink2);text-decoration:none;padding:4px 10px;border-radius:6px;white-space:nowrap;font-size:13px}
 nav a:hover{background:var(--chip);color:var(--ink)}
-nav button{margin-left:auto}
+nav #theme{margin-left:auto}
+#pswitch{display:none;align-items:center;gap:4px;margin-right:10px}
+#pswitch.on{display:flex}
+#psel{max-width:min(46vw,380px);text-overflow:ellipsis}
+#seclinks{display:contents}
 main{max-width:1180px;margin:0 auto;padding:20px 16px 80px}
 section{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:20px 22px;margin:0 0 18px}
 h1{font-size:22px;margin:0 0 4px} h2{font-size:17px;margin:0 0 4px} h3{font-size:14px;margin:18px 0 6px}
@@ -178,14 +187,16 @@ details{margin-top:10px} summary{cursor:pointer;color:var(--ink2);font-size:13px
 </head>
 <body>
 <nav id="nav">
-  <a href="#s-head">Обзор</a><a href="#s-pipeline">Конвейер</a><a href="#s-tokens">Токены</a>
+  <span id="pswitch"><button id="pprev" title="Предыдущий промпт (клавиша [)">‹</button><select id="psel" title="Выбор промпта; клавиши [ и ] — предыдущий и следующий"></select><button id="pnext" title="Следующий промпт (клавиша ])">›</button></span>
+  <span id="seclinks"><a href="#s-head">Обзор</a><a href="#s-pipeline">Конвейер</a><a href="#s-tokens">Токены</a>
   <a href="#s-emb">Эмбеддинги</a><a href="#s-layers">Слои</a><a href="#s-resid">Вектор по слоям</a>
   <a href="#s-lens">Logit lens</a><a href="#s-dla">Вклад слоёв</a><a href="#s-tokattr">Вклад токенов</a>
   <a href="#s-attn">Внимание</a><a href="#s-sample">Выбор токена</a>
-  <a href="#s-map">Карта важности</a><a href="#s-patch" id="n-patch">Патчинг</a><a href="#s-quant" id="n-quant">Квантизация</a><a href="#s-weights">Веса</a>
+  <a href="#s-map">Карта важности</a><a href="#s-patch" id="n-patch">Патчинг</a><a href="#s-quant" id="n-quant">Квантизация</a><a href="#s-weights">Веса</a></span>
   <button id="theme" title="Светлая / тёмная тема">◐</button>
 </nav>
 <main>
+  <section id="s-summary" style="display:none"></section>
   <section id="s-head"></section>
   <section id="s-pipeline"></section>
   <section id="s-tokens"></section>
@@ -209,8 +220,9 @@ details{margin-top:10px} summary{cursor:pointer;color:var(--ink2);font-size:13px
 <script>
 (function(){
 "use strict";
-const D = JSON.parse(document.getElementById('data').textContent);
-const M = D.model, NL = M.layers, TY = M.layer_types.split('');
+// Один отчёт — один прогон (блок #data) или пакет: блок #batch со сводкой и по блоку #d-N на промпт.
+const BATCH = document.getElementById('batch') ? JSON.parse(document.getElementById('batch').textContent) : null;
+let D, M, NL, TY;
 const $ = s => document.querySelector(s);
 const esc = s => String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const vis = s => esc(String(s).replace(/\n/g,'↵').replace(/ /g,'␣'));
@@ -231,13 +243,18 @@ const clip = (s,n) => s.length>n ? s.slice(0,n-1)+'…' : s;
 const empty = msg => `<div class="empty">${msg}</div>`;
 const hdr = (id, title, lead) => `<h2>${title}</h2><p class="lead">${lead}</p>`;
 
-const lensSteps = Object.keys(D.lens).map(Number).sort((a,b)=>a-b);
-const S = {tok: 0, layer: null, lens: lensSteps.length ? lensSteps[0] : null, sstep: 0, metric: 'kl', attn: null, hl: null};
-const LMX = D.layer_map;                       // карта в любом виде (в т.ч. быстрая, без перебора)
-const LM = LMX && !LMX.fast ? LMX : null;      // карта с полным перебором
-const MP = (D.meta && D.meta.params) || {};
-const nTok = D.tokens ? D.tokens.ids.length : 0;
-const toks = D.tokens ? D.tokens.tokens : [];
+let lensSteps, S, LMX, LM, MP, nTok, toks;
+function setData(d){
+  D = d; M = D.model; NL = M.layers; TY = M.layer_types.split('');
+  lensSteps = Object.keys(D.lens).map(Number).sort((a,b)=>a-b);
+  const metric = S ? S.metric : 'kl';            // выбранная метрика карты переживает смену промпта
+  S = {tok: 0, layer: null, lens: lensSteps.length ? lensSteps[0] : null, sstep: 0, metric, attn: null, hl: null, aq: null, lg: 'top', dt: 0, dr: 1};
+  LMX = D.layer_map;                             // карта в любом виде (в т.ч. быстрая, без перебора)
+  LM = LMX && !LMX.fast ? LMX : null;            // карта с полным перебором
+  MP = (D.meta && D.meta.params) || {};
+  nTok = D.tokens ? D.tokens.ids.length : 0;
+  toks = D.tokens ? D.tokens.tokens : [];
+}
 const lensRows = () => S.lens==null ? [] : (D.lens[String(S.lens)] || []);
 const residOf = () => S.lens==null ? null : D.resid[String(S.lens)];
 
@@ -531,6 +548,29 @@ function stepPicker(){
 }
 
 // ───────────── Logit lens ─────────────
+function lensGrid(){
+  const G = D.lens_grid;
+  if (!G) return '<div class="note">Сетки по всем позициям промпта в этом журнале нет — пересоберите прогон новой версией trace_qwen.py.</div>';
+  if (S.lens!==0) return '<h3>По всем позициям промпта</h3><p class="muted small">Сетка «слой × позиция» строится для шага 0 — на нём модель читает весь промпт сразу. Выберите шаг 0.</p>';
+  const P = G.positions.length, NG = G.top.length, padL = 54, W = 1100, cw = Math.min(54, (W-padL-8)/P), ch = 13, nextMode = S.lg==='next';
+  const cut = Math.max(2, Math.floor(cw/6.5));
+  let g = '';
+  for (let l=0; l<NG; l++){
+    g += `<text x="${padL-6}" y="${l*ch+10}" text-anchor="end" class="mute" style="font-size:9px">${l}</text>`;
+    for (let j=0; j<P; j++){
+      const pos = G.positions[j], tk = G.vocab[String(G.top[l][j])] || '', pr = G.p[l][j], rk = G.rank[l][j], hasNext = pos < nTok-1;
+      const t = nextMode ? (hasNext ? clamp(1 - Math.log10(rk)/4) : 0) : pr;
+      const nx = hasNext ? `настоящий следующий токен: «${(toks[pos+1]||'').replace(/\n/g,'↵')}», его ранг ${f(rk,0)}` : 'следующий токен — первый токен ответа';
+      g += `<rect x="${padL+j*cw}" y="${l*ch}" width="${cw-1}" height="${ch-1}" style="fill:${seq(t)}"${tip(`слой ${l} · после «${(toks[pos]||'').replace(/\n/g,'↵')}» (поз ${pos})\nожидает дальше: «${tk.replace(/\n/g,'↵')}» (${pct(pr)})\n${nx}`)}></rect>`;
+      g += `<text x="${padL+j*cw+cw/2}" y="${l*ch+10}" text-anchor="middle" class="mono" style="font-size:8.5px;fill:${t>0.55?'var(--card)':'var(--ink)'};pointer-events:none">${vis(clip(tk,cut))}</text>`;
+    }
+  }
+  for (let j=0;j<P;j++) g += `<text transform="translate(${padL+j*cw+cw/2},${NG*ch+8}) rotate(60)" class="mono" style="font-size:10px">${vis(clip(toks[G.positions[j]]||'',10))}</text>`;
+  return `<h3>По всем позициям промпта: что модель ожидает дальше после каждого токена</h3>
+    <p class="lead">График выше — только последняя позиция. Но на шаге 0 модель обрабатывает весь промпт, и на каждой позиции она тоже предсказывает следующий токен. Для токенов промпта продолжение известно, поэтому видно, на каком слое модель его «угадывает». Строка — слой (0 сверху), столбец — позиция, в клетке — самый вероятный следующий токен. Нижняя строка — настоящие предсказания модели; крайний правый столбец — то, что идёт в ответ. ${G.tuned ? 'Использована tuned lens.' : 'Обычный logit lens: в ранних слоях он неточен.'}</p>
+    <div class="legend">цвет: <button class="${nextMode?'':'on'}" data-lg="top">вероятность лучшего токена</button> <button class="${nextMode?'on':''}" data-lg="next">ранг настоящего продолжения (тёмный — угадано)</button></div>
+    <svg viewBox="0 0 ${W} ${NG*ch+70}" role="img" aria-label="Logit lens по всем позициям">${g}</svg>`;
+}
 function renderLens(){
   const L = lensRows();
   if (!L.length) { $('#s-lens').innerHTML = hdr('','Logit lens','') + empty('Нет данных: запустите с --detail-steps 1 или больше.'); return; }
@@ -564,33 +604,69 @@ function renderLens(){
      <div class="note">${tuned ? 'Фиолетовая линия — tuned lens: для каждого слоя обучено преобразование в базис последнего слоя, поэтому ей можно верить и в ранних слоях. Столбцы — обычный logit lens.' : 'В ранних слоях logit lens систематически занижает готовность ответа: их векторы ещё не в том базисе, который читает lm_head. Столбец «KL до итога» в таблице показывает, насколько промежуточное распределение далеко от настоящего. Точнее — tuned lens: обучите её через tuned_lens.py и передайте в --tuned-lens.'}</div>
      <svg viewBox="0 0 ${W} ${y3+20}" role="img" aria-label="Вероятность итогового токена по слоям">${g}</svg>
      <div class="legend"><span><i style="background:var(--blue)"></i>линейный слой</span><span><i style="background:var(--orange)"></i>полное внимание</span>${tuned?'<span><i style="background:var(--violet)"></i>tuned lens</span>':''}</div>
-     <details><summary>таблица по слоям (топ-3 токена, вероятность и ранг итогового)</summary><div class="scroll"><table><tr><th class="num">слой</th><th>тип</th><th>топ-3 после слоя</th><th class="num">p итога</th><th class="num">ранг итога</th>${hasKl?'<th class="num">KL до итога</th>':''}${tuned?'<th>tuned lens: лучший</th><th class="num">ранг итога</th><th class="num">KL</th>':''}</tr>${trs}</table></div></details>`;
+     <details><summary>таблица по слоям (топ-3 токена, вероятность и ранг итогового)</summary><div class="scroll"><table><tr><th class="num">слой</th><th>тип</th><th>топ-3 после слоя</th><th class="num">p итога</th><th class="num">ранг итога</th>${hasKl?'<th class="num">KL до итога</th>':''}${tuned?'<th>tuned lens: лучший</th><th class="num">ранг итога</th><th class="num">KL</th>':''}</tr>${trs}</table></div></details>` + lensGrid();
 }
 
 // ───────────── Внимание ─────────────
 function renderAttn(){
-  const A = S.lens==null ? [] : (D.attention[String(S.lens)] || []);
+  const st = S.lens, A = st==null ? [] : (D.attention[String(st)] || []);
   if (!A.length) { $('#s-attn').innerHTML = hdr('','Внимание','') + empty('Нет данных о внимании: запустите с --detail-steps 1 или больше.'); return; }
-  const rows = A.filter(a => a.dist).map(a => ({a, layer: layerOfName(a.module)})).sort((x,y)=>x.layer-y.layer);
-  if (!rows.length) { $('#s-attn').innerHTML = hdr('','Внимание','') + empty('Контекст слишком длинный для карты внимания.'); return; }
-  const n = rows[0].a.dist.length, padL = 70, padB = 70, W = 1100, cw = Math.min(40, (W-padL-10)/n), ch = 18, H = rows.length*ch + padB;
-  const labelEvery = n>60 ? Math.ceil(n/60) : 1;
-  let g = '';
-  rows.forEach((r,k) => {
-    g += `<text x="${padL-8}" y="${k*ch+13}" text-anchor="end" class="strong" data-layer="${r.layer}" style="cursor:pointer">слой ${r.layer}</text>`;
-    r.a.dist.forEach((v,j) => {
-      g += `<rect x="${padL+j*cw}" y="${k*ch}" width="${cw-1}" height="${ch-1}" style="fill:${seq(Math.sqrt(v))}"${tip(`слой ${r.layer} · смотрит на «${(toks[j]||'').replace(/\n/g,'↵')}» (поз ${j})\nвес ${pct(v)}`)}></rect>`;
-    });
-    if (S.layer===r.layer) g += `<rect class="selframe" x="${padL-2}" y="${k*ch-1}" width="${n*cw+2}" height="${ch+1}"></rect>`;
-  });
-  for (let j=0;j<n;j+=labelEvery) g += `<text transform="translate(${padL+j*cw+cw/2},${rows.length*ch+8}) rotate(60)" class="mono" style="font-size:10px">${vis(clip(toks[j]||'',10))}</text>`;
-  $('#s-attn').innerHTML = hdr('', 'Внимание: на какие токены смотрит последний токен', `В ${TY.filter(t=>t==='A').length} слоях из ${NL} есть полное внимание: последний токен сравнивается со всеми предыдущими и берёт информацию из тех, что важнее. Строка — слой, столбец — токен контекста, цвет — вес (усреднён по головам; шкала корневая, чтобы были видны слабые связи). Нажмите на строку, чтобы открыть слой.`) + stepPicker() +
-    `<svg viewBox="0 0 ${W} ${H}" role="img" aria-label="Карта внимания">${g}</svg>
-     ${headsBlock(rows)}
-     <p class="muted small">В остальных ${TY.filter(t=>t==='L').length} слоях внимание линейное: карты «кто на кого смотрит» у них нет, информация копится во внутреннем состоянии. Что на них влияет, показывает раздел «Вклад токенов».</p>`;
+  const T = toks.concat(D.samples.slice(0, st||0).map(x => x.chosen.token));      // контекст шага: промпт + выбранные токены ответа
+  const byL = {}; A.forEach(a => { const l = layerOfName(a.module); if (l!=null) byL[l] = a; });
+  const full = Object.keys(byL).map(Number).sort((a,b)=>a-b).map(l => ({a: byL[l], layer: l})).filter(r => r.a.matrix || r.a.dist);
+  if (!full.length) { $('#s-attn').innerHTML = hdr('','Внимание','') + empty('Контекст слишком длинный для карты внимания.'); return; }
+  const hasM = full.some(r => r.a.matrix), r0 = full[0].a, n = r0.matrix ? r0.matrix[0].length : r0.dist.length;
+  const qs = hasM ? r0.q_start : n-1, qn = hasM ? r0.matrix.length : 1;
+  if (S.aq==null || S.aq<qs || S.aq>qs+qn-1) S.aq = qs+qn-1;
+  const rowVals = a => a.matrix ? a.matrix[S.aq - a.q_start] : a.dist;
+  const nFull = TY.filter(t=>t==='A').length, firstFull = TY.indexOf('A');
+  const padL = 84, W = 1100, cw = Math.min(40, (W-padL-10)/n), chF = 18, chL = 6, labelEvery = n>60 ? Math.ceil(n/60) : 1;
+  let y = 0, g = '';
+  for (let L=0; L<NL; L++){
+    const r = full.find(x => x.layer===L);
+    if (r) {
+      g += `<text x="${padL-8}" y="${y+13}" text-anchor="end" class="strong" data-layer="${L}" style="cursor:pointer">слой ${L}</text>`;
+      rowVals(r.a).forEach((v,j) => {
+        g += `<rect x="${padL+j*cw}" y="${y}" width="${cw-1}" height="${chF-1}" style="fill:${seq(Math.sqrt(v))}"${tip(`слой ${L} · «${(T[S.aq]||'').replace(/\n/g,'↵')}» (поз ${S.aq}) смотрит на «${(T[j]||'').replace(/\n/g,'↵')}» (поз ${j})\nвес ${pct(v)}`)}></rect>`;
+      });
+      if (S.layer===L) g += `<rect class="selframe" x="${padL-2}" y="${y-1}" width="${n*cw+2}" height="${chF+1}"></rect>`;
+      y += chF;
+    } else {
+      g += `<text x="${padL-8}" y="${y+5}" text-anchor="end" class="mute" style="font-size:8px">${L}</text><rect x="${padL}" y="${y}" width="${n*cw-1}" height="${chL-1}" style="fill:var(--mid)" data-layer="${L}"${tip(`слой ${L}: линейное внимание (Gated DeltaNet)\nматрицы «кто на кого смотрит» у него нет:\nинформация копится в состоянии, а не в весах внимания`)}></rect>`;
+      y += chL;
+    }
+  }
+  for (let j=0;j<n;j+=labelEvery) g += `<text transform="translate(${padL+j*cw+cw/2},${y+8}) rotate(60)" class="mono" style="font-size:10px">${vis(clip(T[j]||'',10))}</text>`;
+  const chips = hasM && qn>1 ? `<div class="legend">чьё внимание показывать (токен-запрос):</div><div class="chips">${Array.from({length:qn},(_,i)=>qs+i).map(p => `<span class="chip${p===S.aq?' on':''}${isSpecial(T[p]||'')?' sp':''}" data-aq="${p}">${vis(T[p]||'')}<small>${p}</small></span>`).join('')}</div>` : '';
+  $('#s-attn').innerHTML = hdr('', 'Внимание: на какие токены смотрит выбранный токен', `Полное (softmax) внимание есть только в ${nFull} слоях из ${NL}: первый такой слой — ${firstFull}, дальше каждый 4-й (${TY.map((t,i)=>t==='A'?i:null).filter(x=>x!=null).slice(0,4).join(', ')}, …). Остальные слои — линейное внимание (Gated DeltaNet): у них нет матрицы «кто на кого смотрит», поэтому с 0-го слоя они показаны тонкими серыми полосками, а подробные строки идут только у слоёв полного внимания. Строка — слой, столбец — токен контекста, цвет — вес (усреднён по головам; шкала корневая, чтобы были видны слабые связи). ${hasM ? 'Выберите токен-запрос: на шаге 0 модель обрабатывает весь промпт сразу, и внимание есть у каждого его токена, а не только у последнего (токен видит только себя и предыдущие).' : ''} Нажмите на строку, чтобы открыть слой.`) + stepPicker() + chips +
+    `<svg viewBox="0 0 ${W} ${y+70}" role="img" aria-label="Карта внимания">${g}</svg>
+     ${headsBlock(full)}<p class="muted small">Разбивка по головам показана только для последнего токена контекста.</p>`;
 }
 
 // ───────────── Выбор токена ─────────────
+const pf = p => p>=0.001 ? f(p,4) : Number(p).toExponential(2);
+function entropyBlock(s){
+  const d = s.detail;
+  if (!d) return '<div class="note">Для этого прогона нет пошагового расчёта энтропии — пересоберите его новой версией trace_qwen.py.</div>';
+  let cum = 0;
+  const tm = Math.max(...d.top.map(t => t.term), 1e-12);
+  const rows = d.top.map((t,i) => { cum += t.term; return `<tr class="${i===0?'hl':''}"><td class="num">${i+1}</td><td class="mono">${vis(t.token)}</td><td class="num">${t.logit}</td><td class="num">${f(t.logit-d.lse,3)}</td><td class="num">${pf(t.prob)}</td><td class="num">${f(t.term,5)}</td><td style="width:150px"><span class="bar" style="width:${t.term/tm*140}px;background:var(--orange)"></span></td><td class="num">${f(cum,5)}</td></tr>`; }).join('');
+  const tail = d.tail, sumRows = d.top_term + tail.term;
+  const share = s.entropy / d.max_entropy;
+  const mean = d.perplexity < 1.5 ? 'модель почти не колеблется: ответ практически предопределён' : d.perplexity < 5 ? 'модель выбирает из нескольких правдоподобных вариантов' : 'модель сильно сомневается: правдоподобных вариантов много';
+  return `<h3>Как посчитана энтропия на шаге ${s.step}</h3>
+    <p class="lead">Энтропия измеряет, насколько «размазано» распределение вероятностей: 0 — вся вероятность у одного токена, больше — модель колеблется. Считается в четыре действия.</p>
+    <ol class="lead" style="margin:0 0 10px 18px;padding:0">
+      <li><b>Логиты → вероятности.</b> У модели ${f(d.vocab,0)} оценок (логитов) zᵢ — по одной на токен словаря. Вероятность pᵢ = exp(zᵢ − L), где L = ln Σⱼ exp(zⱼ) = <b>${d.lse}</b> — нормировка, чтобы сумма была 1. Разность zᵢ − L — это ln pᵢ (колонка «ln p»).</li>
+      <li><b>Вклад каждого токена:</b> −pᵢ · ln pᵢ. Токен с p≈1 или p≈0 почти ничего не вносит; больше всего вносят токены средней вероятности.</li>
+      <li><b>Сумма по всем токенам:</b> H = Σᵢ (−pᵢ · ln pᵢ). Ниже по строкам — 20 самых вероятных токенов, а остальные ${f(tail.n,0)} объединены в одну строку: у них общая масса ${pf(tail.mass)} и общий вклад ${f(tail.term,5)}.</li>
+      <li><b>Единицы:</b> натуральный логарифм даёт «наты»; в битах H делится на ln 2 (≈0,693).</li>
+    </ol>
+    <div class="scroll" style="max-height:520px"><table><tr><th class="num">#</th><th>токен</th><th class="num">логит z</th><th class="num">ln p = z − L</th><th class="num">p</th><th class="num">−p · ln p</th><th></th><th class="num">нарастающая сумма</th></tr>${rows}
+      <tr><td></td><td class="muted">ещё ${f(tail.n,0)} токенов</td><td></td><td></td><td class="num">${pf(tail.mass)}</td><td class="num">${f(tail.term,5)}</td><td></td><td class="num">${f(sumRows,5)}</td></tr></table></div>
+    <div class="tiles"><div class="tile"><b>${s.entropy}</b><span>H = ${f(d.top_term,4)} (топ-20) + ${f(tail.term,4)} (хвост), нат</span></div><div class="tile"><b>${f(d.bits,3)}</b><span>H в битах</span></div><div class="tile"><b>${f(d.perplexity,2)}</b><span>exp(H): как выбор из стольких равновероятных токенов</span></div><div class="tile"><b>${pct(share)}</b><span>от максимума ln ${f(d.vocab,0)} = ${f(d.max_entropy,2)} нат (все токены равновероятны)</span></div></div>
+    <p class="muted small">Вывод: ${mean}. ${MP.temperature>0 ? `Расчёт — для исходных логитов (температура 1); при сэмплировании с temperature ${MP.temperature} логиты делятся на неё, и распределение, из которого реально выбирался токен, острее или площе.` : 'Токен выбирается жадно (самый вероятный), поэтому энтропия здесь — мера уверенности, а не случайности.'} Линия на графике выше — это H по шагам в натах.</p>`;
+}
 function renderSample(){
   const smp = D.samples;
   if (!smp.length) { $('#s-sample').innerHTML = hdr('','Выбор токена','') + empty('Нет данных.'); return; }
@@ -612,9 +688,10 @@ function renderSample(){
     `<svg viewBox="0 0 ${W} ${H}" role="img" aria-label="Вероятность выбранных токенов по шагам">${g}</svg>
      <div class="legend muted">столбец — вероятность выбранного токена, линия — энтропия распределения (чем выше, тем больше модель сомневалась). Нажмите на столбец.</div>
      <h3>Шаг ${k}: кандидаты <span class="muted small">(${f(s.ms,0)} мс)</span></h3>
-     <div class="tiles"><div class="tile"><b>${s.entropy}</b><span>энтропия</span></div><div class="tile"><b>${f(s.nucleus95,0)}</b><span>токенов в nucleus (95% массы)</span></div><div class="tile"><b>${pct(s.top20_mass)}</b><span>масса топ-20</span></div></div>
+     <div class="tiles"><div class="tile"><b>${s.entropy}</b><span>энтропия, нат</span></div><div class="tile"><b>${f(s.nucleus95,0)}</b><span>токенов в nucleus (95% массы)</span></div><div class="tile"><b>${pct(s.top20_mass)}</b><span>масса топ-20</span></div></div>
      <table><tr><th>токен</th><th class="num">логит</th><th class="num">вероятность</th><th></th></tr>${cr}</table>
-     <p class="muted small">Если nucleus большой (сотни токенов), при случайном сэмплировании модель могла бы выбрать много разных продолжений; если равен 1–2, выбор почти предопределён.</p>`;
+     <p class="muted small">Если nucleus большой (сотни токенов), при случайном сэмплировании модель могла бы выбрать много разных продолжений; если равен 1–2, выбор почти предопределён.</p>
+     ${entropyBlock(s)}`;
 }
 
 // ───────────── Карта важности ─────────────
@@ -639,7 +716,9 @@ function renderMap(){
   const hv = Math.max(...rows.map(r => Math.max(...r[pk]))) || 1;
   let hm = '';
   LM.prompts.forEach((p,k) => {
-    hm += `<text x="${padL2-6}" y="${ty+k*ch+13}" text-anchor="end"${tip(p.prompt+'\n→ '+p.answer)}>${esc(clip(p.prompt,40))}</text>`;
+    const bi = BATCH ? BATCH.entries.findIndex(e2 => e2.status==='ok' && e2.prompt===p.prompt) : -1, cur = D.prompt && p.prompt===D.prompt.prompt;
+    const jump = bi>=0 && !cur;
+    hm += `<text x="${padL2-6}" y="${ty+k*ch+13}" text-anchor="end"${jump ? ` data-prompt="${bi}"` : ''} style="${cur ? 'font-weight:700;fill:var(--ink)' : jump ? 'text-decoration:underline;fill:var(--blue);cursor:pointer' : ''}"${tip(p.prompt+'\n→ '+p.answer+(cur ? '\n(открыт сейчас)' : jump ? '\n(нажмите — открыть разбор этого промпта)' : ''))}>${cur ? '▶ ' : ''}${esc(clip(p.prompt,40))}</text>`;
     rows.forEach((r,i) => {
       const v = r[pk][k];
       hm += `<rect x="${padL2+i*cw2}" y="${ty+k*ch}" width="${Math.max(cw2-1,1)}" height="${ch-1}" style="fill:${seq(Math.sqrt(v/hv))}" data-layer="${r.first_layer}"${tip(`${p.prompt}\nслой ${r.layers}: ${S.metric==='broken'?'сломано '+pct(v):'KL '+v}`)}></rect>`;
@@ -659,7 +738,7 @@ function renderMap(){
     `<div class="legend">метрика: ${[['kl','KL'],['broken','сломано'],['p','1 − p(исх.)']].map(([k,t]) => `<button class="${S.metric===k?'on':''}" data-metric="${k}">${t}</button>`).join(' ')}
       <span><i style="background:var(--blue)"></i>линейный</span><span><i style="background:var(--orange)"></i>полное внимание</span>${ci?'<span class="muted">чёрная черта — 95% доверительный интервал (бутстреп по промптам)</span>':''}<span class="muted">нажмите на столбец или клетку — откроется слой</span></div>
     <svg viewBox="0 0 ${W} ${y1+24}" role="img" aria-label="Важность слоёв">${g}</svg>
-    <h3>По промптам <span class="muted small">— видно, какие слои нужны только для отдельных задач</span></h3>
+    <h3>По промптам <span class="muted small">— видно, какие слои нужны только для отдельных задач${BATCH ? '; нажмите на промпт, чтобы открыть его разбор' : ''}</span></h3>
     <svg viewBox="0 0 ${W} ${Hh}" role="img" aria-label="Важность слоёв по промптам">${hm}</svg>
     ${few}<div class="cols"><div><h3>Самые важные</h3><table><tr><th></th><th class="num">KL</th>${ih}<th class="num">сломано</th></tr>${lst(rk.slice(0,nn))}</table></div>
     <div><h3>Наименее важные <span class="muted small">(${hasCi?'по верхней границе интервала; ':''}кандидаты на удаление)</span></h3><table><tr><th></th><th class="num">KL</th>${ih}<th class="num">сломано</th></tr>${lst(safe)}</table>${overlap?'<p class="muted small">Интервалы этих слоёв пересекаются: порядок внутри списка статистически не значим.</p>':''}</div></div>
@@ -690,8 +769,13 @@ const sgn = (x,d=3) => x==null ? '—' : (x>0?'+':'') + f(x,d);
 function renderDla(){
   const sec = $('#s-dla'), A = S.lens==null ? null : D.dla[String(S.lens)];
   if (!A) { sec.innerHTML = hdr('', 'Разложение логита по слоям', '') + empty('Нет данных: запустите с --detail-steps 1 или больше.'); return; }
+  const cands = A.cands || [A.target, A.other], K = cands.length, rich = A.components.some(c => c.logits);
+  if (!rich) { S.dt = 0; S.dr = 1; }
+  S.dt = Math.min(S.dt, K-1); S.dr = Math.min(S.dr, K-1); if (S.dr===S.dt) S.dr = (S.dt+1) % K;
+  const dif = c => rich ? c.logits[S.dt]-c.logits[S.dr] : c.diff, lgt = c => rich ? c.logits[S.dt] : c.logit;
+  const tgt = cands[S.dt], rvl = cands[S.dr];
   const att = Array(NL).fill(0), mlp = Array(NL).fill(0); let emb = 0;
-  A.components.forEach(c => { if (c.kind==='emb') emb = c.diff; else if (c.kind==='attn') att[c.layer] = c.diff; else mlp[c.layer] = c.diff; });
+  A.components.forEach(c => { const d = dif(c); if (c.kind==='emb') emb = d; else if (c.kind==='attn') att[c.layer] = d; else mlp[c.layer] = d; });
   const total = emb + sum(att) + sum(mlp);
   const bars = divBars([{col:'--violet', vals:att}, {col:'--aqua', vals:mlp}], {label:'Вклад слоёв в разность логитов',
     tip: i => `слой ${i} (${TY[i]==='L'?'линейный':'полное внимание'})\nвнимание ${sgn(att[i])}\nMLP ${sgn(mlp[i])}\nвсего ${sgn(att[i]+mlp[i])}`});
@@ -700,15 +784,18 @@ function renderDla(){
   const cmx = Math.max(...cum, emb, 0), cmn = Math.min(...cum, emb, 0), cs = (cmx-cmn)||1, W = 1100, padL = 60, cw = (W-68)/NL, Yc = v => 10+(cmx-v)/cs*70;
   const line = `<svg viewBox="0 0 ${W} 96" role="img" aria-label="Накопленная разность логитов"><line class="axis" x1="${padL}" x2="${W-8}" y1="${Yc(0)}" y2="${Yc(0)}"/><text x="${padL-6}" y="14" text-anchor="end" class="mute">${f(cmx,1)}</text><text x="${padL-6}" y="84" text-anchor="end" class="mute">${f(cmn,1)}</text><path class="line" d="${cum.map((v,i)=>(i?'L':'M')+(padL+i*cw+cw/2)+','+Yc(v)).join(' ')}"/>${cum.map((v,i)=>`<rect class="hit" x="${padL+i*cw}" y="6" width="${cw}" height="80" data-layer="${i}"${tip(`после слоя ${i}: разность ${sgn(v)}`)}></rect>`).join('')}</svg>`;
   const nm = {emb:'эмбеддинг', attn:'внимание', mlp:'MLP'};
-  const top = [...A.components].sort((a,b)=>Math.abs(b.diff)-Math.abs(a.diff)).slice(0,10), tm = Math.abs(top[0].diff) || 1;
-  const trs = top.map(c => `<tr><td>${c.layer==null ? nm[c.kind] : `слой ${c.layer} · ${nm[c.kind]}`}</td><td class="num">${sgn(c.diff)}</td><td style="width:240px"><span class="bar" style="width:${Math.abs(c.diff)/tm*220}px;background:var(${c.diff>=0?'--blue':'--red'})"></span></td><td class="num">${sgn(c.logit)}</td></tr>`).join('');
-  sec.innerHTML = hdr('', 'Разложение логита: какие слои привели к ответу', `Выход модели — сумма записей в «остаточный поток»: эмбеддинг плюс вклад внимания и MLP каждого слоя. Поэтому преимущество выбранного токена над главным соперником раскладывается по слоям точно, без дополнительных прогонов. Столбец вверх — слой подталкивал к выбранному токену, вниз — к сопернику.`) + stepPicker() +
-    `<div class="tiles"><div class="tile"><b class="mono">${vis(A.target.token)}</b><span>выбранный токен</span></div><div class="tile"><b class="mono">${vis(A.other.token)}</b><span>главный соперник</span></div><div class="tile"><b>${sgn(total,2)}</b><span>разность логитов (сумма вкладов)</span></div><div class="tile"><b>${sgn(emb,2)}</b><span>из них эмбеддинг</span></div></div>
+  const top = [...A.components].sort((a,b)=>Math.abs(dif(b))-Math.abs(dif(a))).slice(0,10), tm = Math.abs(dif(top[0])) || 1;
+  const trs = top.map(c => `<tr><td>${c.layer==null ? nm[c.kind] : `слой ${c.layer} · ${nm[c.kind]}`}</td><td class="num">${sgn(dif(c))}</td><td style="width:240px"><span class="bar" style="width:${Math.abs(dif(c))/tm*220}px;background:var(${dif(c)>=0?'--blue':'--red'})"></span></td><td class="num">${sgn(lgt(c))}</td></tr>`).join('');
+  const opt = sel => cands.map((c,j) => `<option value="${j}"${j===sel?' selected':''}>${vis(c.token)}  (${pct(c.prob)})</option>`).join('');
+  const pick = rich ? `<div class="legend">сравнить: <select data-dla="t">${opt(S.dt)}</select> над <select data-dla="r">${opt(S.dr)}</select> <span class="muted">любая пара из ${K} лучших кандидатов этого шага; первый в списке — выбранный токен</span></div>` : `<div class="note">В этом журнале вклады посчитаны только для пары «выбранный токен — соперник»; чтобы сравнивать любые пары, пересоберите прогон новой версией trace_qwen.py.</div>`;
+  const sumL = A.logits_sum ? A.logits_sum[S.dt] : A.logit_sum, actL = A.logits_actual ? A.logits_actual[S.dt] : A.logit_actual;
+  sec.innerHTML = hdr('', 'Разложение логита: какие слои привели к ответу', `Раскладывается логит <b>последней позиции</b> шага — тот, по которому модель выбирает следующий токен: у других позиций логиты тоже есть, но для ответа не используются (их «ожидания» по слоям — в разделе Logit lens, сетка по всем позициям). Выход модели — сумма записей в «остаточный поток»: эмбеддинг плюс вклад внимания и MLP каждого слоя. Поэтому преимущество одного токена над другим раскладывается по слоям точно, без дополнительных прогонов. Столбец вверх — слой подталкивал к первому токену пары, вниз — ко второму.`) + stepPicker() + pick +
+    `<div class="tiles"><div class="tile"><b class="mono">${vis(tgt.token)}</b><span>токен</span></div><div class="tile"><b class="mono">${vis(rvl.token)}</b><span>с чем сравниваем</span></div><div class="tile"><b>${sgn(total,2)}</b><span>разность логитов (сумма вкладов)</span></div><div class="tile"><b>${sgn(emb,2)}</b><span>из них эмбеддинг</span></div></div>
      ${bars}
      <div class="legend"><span><i style="background:var(--violet)"></i>внимание (полное или линейное)</span><span><i style="background:var(--aqua)"></i>MLP</span></div>
      <h3>Накопленное преимущество <span class="muted small">— где ответ «решился»</span></h3>${line}
-     <h3>Самые влиятельные компоненты</h3><table><tr><th>компонента</th><th class="num">вклад в разность</th><th></th><th class="num">вклад в логит токена</th></tr>${trs}</table>
-     <p class="muted small">Проверка: сумма вкладов в логит ${f(A.logit_sum,3)}, настоящий логит ${f(A.logit_actual,3)}. Разложение показывает прямой вклад в выход; косвенное влияние слоя через следующие слои видно в карте важности и патчинге.</p>`;
+     <h3>Самые влиятельные компоненты</h3><table><tr><th>компонента</th><th class="num">вклад в разность</th><th></th><th class="num">вклад в логит «${vis(tgt.token)}»</th></tr>${trs}</table>
+     <p class="muted small">Проверка: сумма вкладов в логит «${vis(tgt.token)}» ${f(sumL,3)}, настоящий логит ${f(actL,3)}. Разложение показывает прямой вклад в выход; косвенное влияние слоя через следующие слои видно в карте важности и патчинге.</p>`;
 }
 
 // ───────────── Вклад токенов контекста ─────────────
@@ -874,10 +961,95 @@ function renderWeights(){
 }
 
 // ───────────── Отрисовка и события ─────────────
-function renderAll(){ renderHead(); renderPipeline(); renderTokens(); renderEmb(); renderLayers(); renderResid(); renderLens(); renderDla(); renderTokAttr(); renderAttn(); renderSample(); renderMap(); renderMap2(); renderPatch(); renderQuant(); renderAblation(); renderWeights();
-  if (!D.patching) $('#n-patch').style.display = 'none';
-  if (!D.quant) $('#n-quant').style.display = 'none'; }
-renderAll();
+// ───────────── Сводка по пакету ─────────────
+function sumBars(vals, H, label, tipf, cols){
+  const n = vals.length, W = 1100, padL = 60, padR = 8, cw = (W-padL-padR)/n, y0 = 14;
+  const tot = vals.map(v => Array.isArray(v) ? sum(v) : v), vmax = Math.max(...tot, 1e-9);
+  let g = `<line class="axis" x1="${padL}" x2="${W-padR}" y1="${y0+H}" y2="${y0+H}"/><text x="${padL-6}" y="${y0+4}" text-anchor="end" class="mute">${f(vmax,2)}</text><text x="${padL-6}" y="${y0+H}" text-anchor="end" class="mute">0</text>`;
+  vals.forEach((v,i) => {
+    let y = y0+H;
+    (Array.isArray(v) ? v : [v]).forEach((x,k) => { const h = x/vmax*H; y -= h; g += `<rect x="${padL+i*cw+1}" y="${y}" width="${Math.max(cw-2,1)}" height="${Math.max(h,0)}" rx="1" style="fill:var(${cols[k%cols.length]})"></rect>`; });
+    g += `<rect class="hit" x="${padL+i*cw}" y="${y0}" width="${cw}" height="${H}"${tip(tipf(i))}></rect>`;
+    if (n<=16 || i%4===3) g += `<text x="${padL+i*cw+cw/2}" y="${y0+H+14}" text-anchor="middle" class="mute">${i}</text>`;
+  });
+  return `<svg viewBox="0 0 ${W} ${y0+H+20}" role="img" aria-label="${esc(label)}">${g}</svg>`;
+}
+function renderSummary(){
+  const E = BATCH.entries, ok = E.filter(e => e.status==='ok'), bad = E.length - ok.length;
+  const NL0 = BATCH.layers, TY0 = BATCH.layer_types || '', mo = (BATCH.meta && BATCH.meta.model) || {};
+  const firstOk = E.findIndex(e => e.status==='ok');
+  const nm = {attn:'внимание', mlp:'MLP', emb:'эмбеддинг'};
+  const rows = E.map((e,i) => {
+    if (e.status!=='ok') return `<tr><td class="num">${i+1}</td><td>${esc(clip(e.prompt,70))}</td><td colspan="6" style="color:var(--red)">ошибка: ${esc(e.error||'')}</td></tr>`;
+    const fl = e.first || {}, tt = e.top_token, td = e.top_dla;
+    return `<tr><td class="num">${i+1}</td><td><a href="#" data-prompt="${i}"${tip(e.prompt)}>${esc(clip(e.prompt,60))}</a></td>
+      <td${tip(e.answer)}>${esc(clip(e.answer,34))}</td>
+      <td><span class="mono">${vis(fl.token||'')}</span> <span class="muted">${pct(fl.prob)}</span></td>
+      <td class="num">${f(fl.entropy,2)}</td>
+      <td class="num">${e.settle==null ? '—' : e.settle}</td>
+      <td>${tt ? `<span class="mono">${vis(tt.token)}</span> <span class="muted">${sgn(tt.score,3)}</span>` : '—'}</td>
+      <td>${td ? (td.layer==null ? nm[td.kind] : `слой ${td.layer} · ${nm[td.kind]}`) + ` <span class="muted">${sgn(td.diff,2)}</span>` : '—'}</td>
+      ${BATCH.has_map ? `<td class="num"${e.map_top ? tip(`KL при отключении слоя ${e.map_top.layers}: ${f(e.map_top.kl)}\nв среднем по промптам: ${f(e.map_top.mean)} (в ${f(e.map_top.ratio,1)} раза меньше)`) : ''}>${e.map_top ? e.map_top.layers : '—'}</td>` : ''}</tr>`;
+  }).join('');
+  let agg = '';
+  if (ok.length) {
+    const settled = ok.filter(e => e.settle!=null), never = ok.length - settled.length;
+    const cnt = Array(NL0).fill(0); settled.forEach(e => cnt[e.settle]++);
+    agg += `<h2>На каком слое «созревает» ответ</h2><p class="lead">Сколько промптов имеют итоговый первый токен самым вероятным по logit lens начиная с данного слоя (и до конца). Если столбцы сгруппированы у последних слоёв, ответ формируется поздно; разброс говорит, что у разных промптов это происходит на разной глубине.</p>
+      ${sumBars(cnt, 120, 'Слой, с которого ответ лидирует', i => `слой ${i}: ${cnt[i]} промптов`, ['--blue'])}
+      <p class="muted small">${never ? `У ${never} промптов итоговый токен до конца не стал самым вероятным по logit lens. ` : ''}Logit lens в ранних слоях неточен — для надёжных выводов используйте tuned lens.</p>`;
+    const withD = ok.filter(e => e.dla_abs);
+    if (withD.length) {
+      const at = Array(NL0).fill(0), ml = Array(NL0).fill(0);
+      withD.forEach(e => e.dla_abs.attn.forEach((v,i) => { at[i] += v/withD.length; ml[i] += e.dla_abs.mlp[i]/withD.length; }));
+      agg += `<h2>Какие слои дают самый большой вклад в логит</h2><p class="lead">Средний по ${withD.length} промптам модуль вклада слоя в преимущество выбранного токена над соперником (шаг 0). Высокие столбцы у одних и тех же слоёв означают, что роль слоя от промпта почти не зависит.</p>
+        ${sumBars(at.map((v,i)=>[v,ml[i]]), 140, 'Средний вклад слоёв в логит', i => `слой ${i} (${TY0[i]||''})\nвнимание ${f(at[i])}\nMLP ${f(ml[i])}`, ['--violet','--aqua'])}
+        <div class="legend"><span><i style="background:var(--violet)"></i>внимание</span><span><i style="background:var(--aqua)"></i>MLP</span></div>`;
+    }
+  }
+  $('#s-summary').innerHTML = `<h1>Сводка по ${E.length} промптам</h1>
+    <div class="muted small">прогон ${esc(BATCH.run)}${BATCH.created ? ' · ' + esc(BATCH.created.replace('T',' ')) : ''}${mo.path ? ' · ' + esc(mo.path) : ''}</div>
+    <p class="lead">Выберите промпт вверху страницы (или нажмите на него в таблице) — все разделы ниже перерисуются под него. Клавиши <b>[</b> и <b>]</b> листают промпты. Здесь — что у всех прогонов общего.</p>
+    <div class="tiles"><div class="tile"><b>${ok.length}</b><span>промптов разобрано</span></div>${bad ? `<div class="tile"><b>${bad}</b><span>с ошибкой</span></div>` : ''}<div class="tile"><b>${NL0}</b><span>слоёв</span></div>${BATCH.has_map && firstOk>=0 ? `<div class="tile"><b><a href="#" data-prompt="${firstOk}" data-go="s-map">карта</a></b><span>важность слоёв по этим промптам</span></div>` : ''}</div>
+    <h2>Все промпты</h2><p class="lead">Первый токен ответа: выбранный токен и его вероятность, энтропия распределения, слой, с которого токен лидирует до конца (logit lens), токен контекста с наибольшим вкладом, компонента с наибольшим вкладом в логит${BATCH.has_map ? ' и слой, отключение которого вредит именно этому промпту сильнее, чем в среднем остальным (по карте важности, не менее чем в 1,5 раза сильнее среднего; иначе прочерк)' : ''}.</p>
+    <div class="scroll" style="max-height:640px"><table><tr><th class="num">#</th><th>промпт</th><th>ответ</th><th>первый токен</th><th class="num">энтропия</th><th class="num">слой «созревания»</th><th>токен контекста</th><th>вклад в логит</th>${BATCH.has_map ? '<th class="num">особенно важный слой</th>' : ''}</tr>${rows}</table></div>${agg}`;
+}
+
+// ───────────── Переключатель промптов ─────────────
+function showPrompt(i){                           // i = -1 — сводка
+  const sum_ = i < 0;
+  $('#s-summary').style.display = sum_ ? '' : 'none';
+  document.querySelectorAll('main > section:not(#s-summary)').forEach(sec => { sec.style.display = sum_ ? 'none' : ''; });
+  $('#seclinks').style.display = sum_ ? 'none' : 'contents';
+  $('#psel').value = String(i);
+  if (sum_) { renderSummary(); return; }
+  const d = JSON.parse(document.getElementById('d-' + i).textContent);   // разбирается только открытый промпт
+  d.layer_map = BATCH.layer_map;
+  setData(d); renderAll();
+}
+function stepPrompt(dir){
+  const cur = +$('#psel').value, okIdx = BATCH.entries.map((e,i) => e.status==='ok' ? i : -1).filter(i => i>=0);
+  if (!okIdx.length) return;
+  const next = dir > 0 ? okIdx.find(i => i > cur) : [...okIdx].reverse().find(i => i < cur);
+  if (next != null) showPrompt(next);
+}
+function initBatch(){
+  $('#pswitch').classList.add('on');
+  $('#psel').innerHTML = `<option value="-1">Сводка по всем промптам (${BATCH.entries.length})</option>` +
+    BATCH.entries.map((e,i) => `<option value="${i}"${e.status==='ok' ? '' : ' disabled'}>${i+1}. ${esc(clip(e.prompt,80))}${e.status==='ok' ? '' : ' — ошибка'}</option>`).join('');
+  $('#psel').addEventListener('change', () => showPrompt(+$('#psel').value));
+  $('#pprev').addEventListener('click', () => stepPrompt(-1));
+  $('#pnext').addEventListener('click', () => stepPrompt(1));
+  showPrompt(-1);
+}
+
+function renderAll(){
+  document.querySelectorAll('main > section:not(#s-summary)').forEach(sec => { sec.style.display = ''; });   // разделы, скрытые у прошлого промпта
+  renderHead(); renderPipeline(); renderTokens(); renderEmb(); renderLayers(); renderResid(); renderLens(); renderDla(); renderTokAttr(); renderAttn(); renderSample(); renderMap(); renderMap2(); renderPatch(); renderQuant(); renderAblation(); renderWeights();
+  $('#n-patch').style.display = D.patching ? '' : 'none';
+  $('#n-quant').style.display = D.quant ? '' : 'none'; }
+if (BATCH) initBatch();
+else { setData(JSON.parse(document.getElementById('data').textContent)); renderAll(); }
 
 const tipEl = $('#tip');
 function showTip(el, x, y){
@@ -891,16 +1063,22 @@ document.addEventListener('mousemove', e => { const el = e.target.closest && e.t
 document.addEventListener('focusin', e => { const el = e.target.closest && e.target.closest('[data-tip]'); if (el) { const b = el.getBoundingClientRect(); showTip(el, b.left+b.width/2, b.top); } });
 document.addEventListener('focusout', () => { tipEl.style.display = 'none'; });
 function act(el){
-  if (el.dataset.layer != null) { S.layer = +el.dataset.layer; renderLayers(); renderAttn(); }
+  if (el.dataset.prompt != null) { showPrompt(+el.dataset.prompt); if (el.dataset.go) { const t = document.getElementById(el.dataset.go); if (t) t.scrollIntoView(); } }
+  else if (el.dataset.layer != null) { S.layer = +el.dataset.layer; renderLayers(); renderAttn(); }
   else if (el.dataset.tok != null) { S.tok = +el.dataset.tok; renderTokens(); renderEmb(); }
   else if (el.dataset.hl != null) { S.hl = +el.dataset.hl; renderAttn(); }
-  else if (el.dataset.lens != null) { S.lens = +el.dataset.lens; renderLayers(); renderResid(); renderLens(); renderDla(); renderTokAttr(); renderAttn(); }
+  else if (el.dataset.aq != null) { S.aq = +el.dataset.aq; renderAttn(); }
+  else if (el.dataset.lg != null) { S.lg = el.dataset.lg; renderLens(); }
+  else if (el.dataset.lens != null) { S.lens = +el.dataset.lens; S.aq = null; renderLayers(); renderResid(); renderLens(); renderDla(); renderTokAttr(); renderAttn(); }
   else if (el.dataset.step != null) { S.sstep = +el.dataset.step; renderSample(); }
   else if (el.dataset.metric != null) { S.metric = el.dataset.metric; renderLayers(); renderMap(); }
   else if (el.dataset.go) { const t = document.getElementById(el.dataset.go); if (t) t.scrollIntoView(); }
 }
-document.addEventListener('click', e => { const el = e.target.closest && e.target.closest('[data-hl],[data-layer],[data-tok],[data-lens],[data-step],[data-metric],[data-go]'); if (el) act(el); });
-document.addEventListener('keydown', e => { if ((e.key==='Enter'||e.key===' ') && e.target.dataset && (e.target.dataset.layer!=null||e.target.dataset.step!=null)) { e.preventDefault(); act(e.target); } });
+document.addEventListener('click', e => { const el = e.target.closest && e.target.closest('[data-prompt],[data-aq],[data-lg],[data-hl],[data-layer],[data-tok],[data-lens],[data-step],[data-metric],[data-go]'); if (el) { if (el.dataset.prompt != null) e.preventDefault(); act(el); } });
+document.addEventListener('change', e => { const el = e.target; if (el && el.dataset && el.dataset.dla) { if (el.dataset.dla==='t') S.dt = +el.value; else S.dr = +el.value; renderDla(); } });
+document.addEventListener('keydown', e => {
+  if (BATCH && (e.key==='[' || e.key===']') && !/^(INPUT|SELECT|TEXTAREA)$/.test(e.target.tagName||'')) { stepPrompt(e.key===']' ? 1 : -1); return; }
+  if ((e.key==='Enter'||e.key===' ') && e.target.dataset && (e.target.dataset.layer!=null||e.target.dataset.step!=null)) { e.preventDefault(); act(e.target); } });
 $('#theme').addEventListener('click', () => {
   const root = document.documentElement, cur = root.getAttribute('data-theme') || (matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light');
   root.setAttribute('data-theme', cur === 'dark' ? 'light' : 'dark');
@@ -912,7 +1090,118 @@ $('#theme').addEventListener('click', () => {
 '''
 
 
+def summarize_run(src, layer_map=None) -> dict:
+    """Короткая сводка одного прогона (src — папка прогона или уже собранные данные).
+    layer_map — общая карта пакета; без неё берётся карта из папки прогона."""
+    D = src if isinstance(src, dict) else build_data(src)
+    NL = D["model"]["layers"]
+    out = {"layers": NL, "layer_types": D["model"]["layer_types"],
+           "answer": D["answer"]["text"] if D["answer"] else "",
+           "n_prompt_tokens": len(D["tokens"]["ids"]) if D["tokens"] else None,
+           "n_tokens": len(D["samples"]),
+           "prefill_ms": D["timing"]["prefill_ms"] if D["timing"] else None}
+    if D["samples"]:
+        s0 = D["samples"][0]
+        out["first"] = {"token": s0["chosen"]["token"], "prob": s0["chosen"]["prob"],
+                        "entropy": s0["entropy"]}
+    # слой, с которого итоговый токен остаётся самым вероятным до конца
+    settle = None
+    for r in reversed(D["lens"].get("0", [])):
+        if r["rank_final"] != 1:
+            break
+        settle = r["layer"]
+    out["settle"] = settle
+    ta = D["token_attrs"].get("0")
+    if ta and ta["scores"]:
+        i = max(range(len(ta["scores"])), key=lambda k: abs(ta["scores"][k]))
+        names = ta.get("tokens") or (D["tokens"]["tokens"] if D["tokens"] else [])
+        out["top_token"] = {"token": names[i] if i < len(names) else "?", "pos": i,
+                            "score": ta["scores"][i]}
+    dla = D["dla"].get("0")
+    if dla:
+        comps = dla["components"]
+        top = max(comps, key=lambda c: abs(c["diff"]))
+        out["top_dla"] = {"kind": top["kind"], "layer": top["layer"], "diff": top["diff"]}
+        attn, mlp = [0.0] * NL, [0.0] * NL
+        for c in comps:
+            if c["kind"] == "attn":
+                attn[c["layer"]] = abs(c["diff"])
+            elif c["kind"] == "mlp":
+                mlp[c["layer"]] = abs(c["diff"])
+        out["dla_abs"] = {"attn": attn, "mlp": mlp}
+    LMD = layer_map or D["layer_map"]
+    if LMD and LMD["layers"] and "kl_per_prompt" in LMD["layers"][0]:
+        me = D["prompt"]["prompt"] if D["prompt"] else None
+        idx = next((k for k, q in enumerate(LMD["prompts"]) if q["prompt"] == me), None)
+        if idx is not None:
+            # «особенно важный» слой — где отключение вредит этому промпту сильнее всего
+            # относительно среднего по промптам. Абсолютный максимум почти всегда слой 0 у
+            # всех, поэтому берём отношение к среднему; слои с пренебрежимым влиянием
+            # (меньше 1% от самого важного) не рассматриваются: там отношение — шум.
+            n = len(LMD["prompts"])
+            mean = [sum(r["kl_per_prompt"]) / n for r in LMD["layers"]]
+            floor = 0.01 * max(mean)
+            cand = [i for i in range(len(mean)) if mean[i] >= floor] or list(range(len(mean)))
+            k = max(cand, key=lambda i: LMD["layers"][i]["kl_per_prompt"][idx] / (mean[i] + 1e-12))
+            ratio = LMD["layers"][k]["kl_per_prompt"][idx] / (mean[k] + 1e-12)
+            if ratio >= 1.5:                  # меньше — промпт ничем не выделяется
+                out["map_top"] = {"layers": LMD["layers"][k]["layers"], "ratio": round(ratio, 2),
+                                  "kl": LMD["layers"][k]["kl_per_prompt"][idx],
+                                  "mean": round(mean[k], 4)}
+    return out
+
+
+def _blob(obj) -> str:
+    """JSON для вставки в <script>: без закрывающих тегов и спецсимволов строк."""
+    return (json.dumps(obj, ensure_ascii=False, separators=(",", ":"))
+            .replace("</", "<\\/").replace("\u2028", "\\u2028").replace("\u2029", "\\u2029"))
+
+
+def build_batch_report(batch_dir, out=None) -> Path:
+    """Один report.html на весь пакет (trace_qwen.py --batch): вверху переключатель между
+    «Сводкой» и подробным разбором каждого промпта. Данные промптов лежат в странице
+    отдельными блоками и разбираются только при открытии, карта слоёв — одна на всех."""
+    batch_dir = Path(batch_dir)
+    b = json.loads((batch_dir / "batch.json").read_text(encoding="utf-8"))
+    lm_path = batch_dir / "layer_map.json"
+    shared_map = json.loads(lm_path.read_text(encoding="utf-8")) if lm_path.exists() else None
+    entries, blobs, meta = [], [], None
+    for i, e in enumerate(b["prompts"]):
+        row = {k: e[k] for k in ("prompt", "dir", "status") if k in e}
+        blob = None
+        if e["status"] == "ok":
+            try:
+                D = build_data(batch_dir / e["dir"])
+                row.update(summarize_run(D, shared_map))
+                D["layer_map"] = None                     # общая карта хранится один раз
+                blob = _blob(D)
+                meta = meta or D["meta"]
+            except Exception as ex:                       # плохой журнал не должен ломать отчёт
+                row.update(status="error", error=f"{type(ex).__name__}: {ex}")
+        else:
+            row["error"] = e.get("error", "")
+        entries.append(row)
+        blobs.append(blob)
+    first = next((r for r in entries if r["status"] == "ok"), None)
+    head = {"run": batch_dir.name, "created": b.get("created"), "meta": meta,
+            "layer_map": shared_map, "has_map": shared_map is not None,
+            "layers": first["layers"] if first else 0,
+            "layer_types": first["layer_types"] if first else "", "entries": entries}
+    scripts = f'<script id="batch" type="application/json">{_blob(head)}</script>\n' + "\n".join(
+        f'<script id="d-{i}" type="application/json">{x}</script>'
+        for i, x in enumerate(blobs) if x is not None)
+    page = (TEMPLATE.replace("__TITLE__", "Отчёт по пакету: " + batch_dir.name)
+            .replace('<script id="data" type="application/json">__DATA__</script>', scripts))
+    out = Path(out) if out else batch_dir / "report.html"
+    out.write_text(page, encoding="utf-8")
+    return out
+
 if __name__ == "__main__":
     if len(sys.argv) < 2:
-        raise SystemExit("python make_report.py trace_logs/<папка_прогона>")
-    print(build_report(sys.argv[1]))
+        raise SystemExit("python make_report.py trace_logs/<папка_прогона>   "
+                         "или   python make_report.py trace_logs/<папка_пакета>")
+    target = Path(sys.argv[1])
+    if (target / "batch.json").exists():          # пакет: один отчёт на все промпты
+        print(build_batch_report(target))
+    else:
+        print(build_report(target))
